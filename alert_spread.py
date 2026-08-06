@@ -6,6 +6,10 @@ IM/IC 跨期展期策略 —— 每日收盘后推送「明日操作」到微信
   - 空仓 & 分位达标              → 明日开仓：多近月+空隔季
   - 空仓 & 分位不达标            → 明日不用开仓
 有消息才推，没消息（两边都持仓中）就不打扰。
+【防漏推措施】
+  1) 幂等守卫：用「最新数据日期」标记已处理，重复跑/双 cron 不重复推
+  2) 价格拉取失败自动回退备用数据源（已含）
+  3) workflow 双 cron（23:00 + 00:00 北京时间）+ 幂等，单日被跳过也能补跑
 """
 import os
 import json
@@ -108,6 +112,13 @@ def push_wechat(title, desp):
 
 def main():
     state = load_state()
+
+    # 防漏推 1：该数据日期已处理过（重复跑/双 cron/重试）则跳过，避免重复推送
+    as_of = str(pd.read_parquet("im_spread_panel_all_i0_i3.parquet")["date"].max().date())
+    if state.get("processed_date") == as_of:
+        print(f"{as_of} 数据已处理过（防重复推送），跳过")
+        return
+
     parts = []
     for prod in ["IM", "IC"]:
         msg, new_h, pct, near, far, cnt = analyze(prod, state)
@@ -118,14 +129,14 @@ def main():
         else:
             print(f"{prod}: 持仓中，不推送")
 
+    state["processed_date"] = as_of
     save_state(state)
 
     if not parts:
         print("今日 IM/IC 均无操作，跳过推送")
         return
 
-    today = dt.date.today()
-    desp = f"日期：{today:%Y-%m-%d}\n\n" + "\n\n".join(parts)
+    desp = f"数据日期：{as_of}\n\n" + "\n\n".join(parts)
     push_wechat("IM/IC 跨期展期 明日操作", desp)
 
 
