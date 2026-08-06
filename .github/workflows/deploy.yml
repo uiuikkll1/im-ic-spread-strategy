@@ -2,7 +2,7 @@ name: Deploy IM-IC Strategy Page
 
 on:
   schedule:
-    - cron: '0 10 * * *'        # 每天 10:00 UTC = 18:00 北京时间
+    - cron: '0 15 * * *'        # 每天 15:00 UTC = 23:00 北京时间（避开新浪期货日线收盘后清算延迟，确保含当天数据）
   workflow_dispatch:           # 允许在 Actions 页面手动触发
   push:
     branches: [main]
