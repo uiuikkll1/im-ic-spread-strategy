@@ -11,7 +11,8 @@ IM/IC 跨期展期策略 —— 每日收盘后推送「明日操作」到微信
 
 【防漏推措施】
   1) 幂等守卫：用「北京时间运行日期」标记已处理，当天双 cron 不重复推
-  2) 行情实时拉取（akshare 日线），分位基于最新数据；失败回退新浪实时
+  2) 分位信号基于连续价差面板序列（先刷新原始数据+重建面板，失败回退旧面板），
+     绝不从单个月份合约历史价算长窗口分位（月份合约寿命仅 1~2 月，历史不足）
   3) 推送失败 → 保留旧状态、不标记已处理 → 下次重试
   4) 顶层异常兜底 → 推告警、不标记已处理（下次重试）
   5) workflow 双 cron + concurrency 防并发双推
@@ -77,32 +78,45 @@ def push_wechat(title, desp):
         return False
 
 
-def compute_pct(prod, near, far, W):
-    """实时拉 near/far 日线，算相对价差滚动分位。返回 (cur_pct, quote_date, nlast, flast)。"""
+def refresh_panels():
+    """刷新全合约原始数据并重建 i0_i3 面板（与实操页同一套管线）。
+    任一环节失败都回退到仓库里已有的面板文件（至少能用陈旧数据，不死机）。"""
     try:
-        dn = ak.futures_zh_daily_sina(symbol=near)
-        df = ak.futures_zh_daily_sina(symbol=far)
-        if dn is None or df is None or len(dn) < 5 or len(df) < 5:
-            raise RuntimeError("akshare 返回空")
+        import fetch_full_data as ffd
+        for prod in ["IM", "IC"]:
+            parquet = f"{prod.lower()}_future_data.parquet"
+            try:
+                ffd.update_future_data(prod, parquet)
+                print(f"[{prod}] 原始数据刷新完成")
+            except Exception as e:
+                print(f"[{prod}] 原始数据刷新失败（用旧数据）: {e}")
+        try:
+            import build_all_spread_panels as bap
+            bap.build_panels("im_future_data.parquet", "im")
+            bap.build_panels("ic_future_data.parquet", "ic")
+            print("面板重建完成")
+        except Exception as e:
+            print(f"面板重建失败（用旧面板）: {e}")
     except Exception as e:
-        print(f"[{prod}] akshare 失败，回退新浪: {e}")
-        prices = __import__("live_signal").fetch_prices()
-        nlast = prices[near]["last"]
-        flast = prices[far]["last"]
-        # 回退源无法算历史分位，直接用实时价差率近似（不推荐，但至少能推）
-        cur_pct = (nlast - flast) / nlast
-        return float(cur_pct), "新浪实时", float(nlast), float(flast)
+        print(f"refresh_panels 异常（用旧面板）: {e}")
 
-    dn = dn[["date", "close"]].rename(columns={"close": "nclose"})
-    df = df[["date", "close"]].rename(columns={"close": "fclose"})
-    m = pd.merge(dn, df, on="date").dropna()
-    m["date"] = pd.to_datetime(m["date"])
-    m = m.sort_values("date").reset_index(drop=True)
-    if len(m) < W + 5:
-        raise RuntimeError(f"{prod} 历史数据不足 {W} 天，仅 {len(m)} 行（near={near}, far={far}）")
-    sr = ((m["nclose"] - m["fclose"]) / m["nclose"]).to_numpy(dtype=float)
+
+def compute_pct(prod, W):
+    """从 i0_i3 面板的连续 spread_rel2 序列算滚动分位。
+    返回 (cur_pct, quote_date, near_code, far_code, nlast, flast)。
+    必须重算 spread_rel2 = (near_close - far_close) / near_close（深贴水为正，与实操页一致），
+    绝不能复用面板里反号的 spread_rel=(far-near)/near。
+    月份合约历史太短（仅 1~2 月），无法单独算长窗口分位，必须从连续面板序列取。"""
+    panel = pd.read_parquet(f"{prod.lower()}_spread_panel_all_i0_i3.parquet")
+    panel = panel.dropna(subset=["near_close", "far_close"]).sort_values("date").reset_index(drop=True)
+    if len(panel) < W + 5:
+        raise RuntimeError(f"{prod} 面板数据不足 {W} 天，仅 {len(panel)} 行")
+    sr = ((panel["near_close"] - panel["far_close"]) / panel["near_close"]).to_numpy(dtype=float)
     pct_all = v1.rolling_pct(sr, W)
-    return float(pct_all[-1]), str(m["date"].iloc[-1].date()), float(m["nclose"].iloc[-1]), float(m["fclose"].iloc[-1])
+    last = panel.iloc[-1]
+    return (float(pct_all[-1]), str(last["date"])[:10],
+            str(last["near_code"]), str(last["far_code"]),
+            float(last["near_close"]), float(last["far_close"]))
 
 
 def analyze(prod, state, run_day):
@@ -110,7 +124,8 @@ def analyze(prod, state, run_day):
     today = run_day                         # 用运行日期判断换月窗口
     near, far = current_c1_c4(prod, today)  # 已过第三个周五会自动滚到下月近月
 
-    cur_pct, qdate, nlast, flast = compute_pct(prod, near, far, W)
+    # 分位从连续面板序列算（与实操页同一管线）；near/far 用 current_c1_c4 给出真实交易合约
+    cur_pct, qdate, _pnear, _pfar, nlast, flast = compute_pct(prod, W)
 
     ltd = contract_last_trade_day(near).date()
     d = today
@@ -153,6 +168,9 @@ def run_core():
     if state.get("processed_date") == run_str:
         print(f"{run_str} 已处理（防重复推送），跳过")
         return
+
+    # 先刷新面板（失败回退旧面板），保证分位基于最新连续序列
+    refresh_panels()
 
     parts = []
     results = {}

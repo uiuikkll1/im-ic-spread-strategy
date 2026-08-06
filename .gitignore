@@ -16,3 +16,6 @@ logs.zip
 !ic_spread_panel_all_i0_i3.parquet
 !中证1000_idx.parquet
 !中证500_idx.parquet
+
+deploy_key
+deploy_key.pub

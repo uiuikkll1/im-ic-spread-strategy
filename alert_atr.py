@@ -207,7 +207,6 @@ def main():
     except Exception as e:
         err = f"ATR 信号系统异常：{e}"
         print(err)
-        st = load_state.__wrapped__ if False else None
         try:
             st = json.load(open(STATE_FILE, "r", encoding="utf-8"))
         except Exception:

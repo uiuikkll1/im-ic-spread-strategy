@@ -32,9 +32,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: atr_state.json
-          key: atr-state-${{ github.run_id }}
-          restore-keys: |
-            atr-state-
+          key: atr-state
 
       - name: Run ATR alert (push to WeChat)
         env:
@@ -47,4 +45,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: atr_state.json
-          key: atr-state-${{ github.run_id }}
+          key: atr-state
