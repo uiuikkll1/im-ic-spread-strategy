@@ -12,5 +12,7 @@ logs.zip
 !ic_main_cont.parquet
 !im_spread_panel_all_i1_i3.parquet
 !ic_spread_panel_all_i1_i3.parquet
+!im_spread_panel_all_i0_i3.parquet
+!ic_spread_panel_all_i0_i3.parquet
 !中证1000_idx.parquet
 !中证500_idx.parquet

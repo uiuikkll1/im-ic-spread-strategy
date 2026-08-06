@@ -7,7 +7,7 @@ from spread_hold_lib import build_px, run_hold, MULT, contract_last_trade_day, _
 import live_signal as ls
 
 INIT = 500000.0
-RBL = 10  # roll buffer
+RBL = 3  # roll buffer（近月腿距到期<=3交易日换月，与网格最优一致）
 
 def extend_data_to_today(raw, pf, mc, prod):
     """联网用 akshare 把期货日线补到最近交易日，避免图表停留在 parquet 最后日期。"""
@@ -16,7 +16,8 @@ def extend_data_to_today(raw, pf, mc, prod):
     except Exception as e:
         print(f'[{prod}] akshare 不可用，跳过联网补数据:', e)
         return raw, pf, mc
-    last_raw = raw['date'].max()
+    # 以 raw/pf/mc 三者最大日期为基准，避免任一面板比 raw 更新时重复追加导致日期不唯一
+    last_raw = max(raw['date'].max(), pf['date'].max(), mc['date'].max())
     today = pd.Timestamp(dt.date.today())
     if last_raw >= today:
         return raw, pf, mc
@@ -80,10 +81,10 @@ def extend_data_to_today(raw, pf, mc, prod):
     return raw, pf, mc
 
 # ---------------- 跑 IM / IC 推荐组合 ----------------
-def run_pair(prod, key, W, enter_high, require_basis=False):
-    raw = pd.read_parquet(f'{prod.lower()}_future_data.parquet'); raw['date']=pd.to_datetime(raw['date']).astype('datetime64[ns]')
-    pf = pd.read_parquet(f'{prod.lower()}_spread_panel_all_{key}.parquet'); pf['date']=pd.to_datetime(pf['date']).astype('datetime64[ns]')
-    mc = pd.read_parquet(f'{prod.lower()}_main_cont.parquet'); mc['date']=pd.to_datetime(mc['date']).astype('datetime64[ns]')
+def run_pair(prod, key, W, enter_high, require_basis=False, rb=RBL):
+    raw = pd.read_parquet(f'{prod.lower()}_future_data.parquet'); raw['date']=pd.to_datetime(raw['date'])
+    pf = pd.read_parquet(f'{prod.lower()}_spread_panel_all_{key}.parquet'); pf['date']=pd.to_datetime(pf['date'])
+    mc = pd.read_parquet(f'{prod.lower()}_main_cont.parquet'); mc['date']=pd.to_datetime(mc['date'])
     # 联网补数据：把期货日线拉到最近交易日，避免图表滞后
     raw, pf, mc = extend_data_to_today(raw, pf, mc, prod)
     px = build_px(raw)
@@ -95,11 +96,11 @@ def run_pair(prod, key, W, enter_high, require_basis=False):
     basis_ok = None
     if require_basis:
         idx_name = '中证1000' if prod=='IM' else '中证500'
-        idx = pd.read_parquet(f'{idx_name}_idx.parquet'); idx['date']=pd.to_datetime(idx['date']).astype('datetime64[ns]')
+        idx = pd.read_parquet(f'{idx_name}_idx.parquet'); idx['date']=pd.to_datetime(idx['date'])
         pf2 = pd.merge_asof(pf.sort_values('date'), idx[['date','close']].rename(columns={'close':'idx_close'}).sort_values('date'),
                             on='date', direction='backward').sort_values('date')
         basis_ok = (pf2['near_close'].values - pf2['idx_close'].values) < 0
-    st, td, eq, pos = run_hold(pf, px, last_day, side='S_far', roll_buf=RBL, pct=pct,
+    st, td, eq, pos = run_hold(pf, px, last_day, side='S_far', roll_buf=rb, pct=pct,
                                enter_high=enter_high, exit_pct=-1.0, init_cap=INIT,
                                exec_price='open', entry_price='open', exit_price='close',
                                basis_ok=basis_ok, return_pos=True)
@@ -176,6 +177,29 @@ def build_block(prod, st, td, e2, corr, label, rule_text, W, eh, sr_align, pct_a
                              pd.Timestamp(r.exit_date).strftime('%Y-%m-%d')])
     if pos is not None:
         hold_periods.append([pd.Timestamp(pos['d']).strftime('%Y-%m-%d'), dates[-1]])
+    # 信号触发日(T日收盘) = 每笔开仓成交日(T+1开盘)的前一个交易日；
+    # 成交日 = 开仓日 / 平仓日。三者用于在走势图打标记。
+    date_index = {d: k for k, d in enumerate(e2['date'])}
+    signal_days = set()
+    for _, r in td.iterrows():
+        ed = pd.Timestamp(r.entry_date)
+        idx = date_index.get(ed)
+        if idx is not None and idx > 0:
+            signal_days.add(e2['date'][idx-1])
+    if pos is not None:
+        ed = pd.Timestamp(pos['d'])
+        idx = date_index.get(ed)
+        if idx is not None and idx > 0:
+            signal_days.add(e2['date'][idx-1])
+    entry_days = set(pd.Timestamp(r.entry_date) for r in td.itertuples(index=False))
+    exit_days = set(pd.Timestamp(r.exit_date) for r in td.itertuples(index=False))
+    if pos is not None:
+        entry_days.add(pd.Timestamp(pos['d']))
+    signal_pct, entry_nav, exit_nav = [], [], []
+    for k, d in enumerate(e2['date']):
+        signal_pct.append(round(float(pct_align[k]),3) if (d in signal_days and not np.isnan(pct_align[k])) else None)
+        entry_nav.append(round(float(e2['nav'].iloc[k])/10000,2) if d in entry_days else None)
+        exit_nav.append(round(float(e2['nav'].iloc[k])/10000,2) if d in exit_days else None)
     return {
         'label':label,'prod':prod,
         'rule':rule_text,
@@ -193,6 +217,7 @@ def build_block(prod, st, td, e2, corr, label, rule_text, W, eh, sr_align, pct_a
         },
         'dates':dates,'nav':nav,'mc':mc,'dd':dd,'spread':spread,'pct':pctv,
         'hold_periods': hold_periods,
+        'signal_pct':signal_pct,'entry_nav':entry_nav,'exit_nav':exit_nav,
         'trades':trades_to_list(td, pos, floating_pnl),
         'pos': {
             'is_holding': pos is not None,
@@ -205,32 +230,23 @@ def build_block(prod, st, td, e2, corr, label, rule_text, W, eh, sr_align, pct_a
         },
     }
 
-# ---------------- 数据准备：若缺失 parquet（如 GitHub Actions 干净检出）则联网重建 ----------------
-import os as _os
-import fetch_full_data as _fd
-if _os.environ.get('FORCE_FETCH') or not _os.path.exists('im_future_data.parquet') or not _os.path.exists('ic_future_data.parquet'):
-    print('=== 联网重建 IM/IC 全量数据（akshare）===')
-    _fd.main()
+# IM: 近月-隔季 i0_i3 = 多当月(c1)+空隔季(c4), W252, 深贴水分位>=0.20
+im_st,im_td,im_eq,im_e2,im_corr,_,_,im_sr,im_pct,im_pos = run_pair('IM','i0_i3',252,0.20,require_basis=False,rb=3)
+im_rule = """<b>品种</b>：中证1000股指期货（IM）｜<b>组合</b>：<b>近月-隔季 = 多当月(c1) + 空隔季(c4)</b>，1:1 锁合约，各1手<br>
+（说明：c1=当月合约，c4=隔季合约——即再下一个季月；本组合是网格全参数中最优的，年化/卡玛显著优于旧的远月-隔季 i1_i3。）<br>
+<b>入场</b>：spread_rel=(当月收盘−隔季收盘)/当月收盘，取滚动252日分位；当<b>分位≥0.20（深贴水）</b>时，于<b>次日开盘</b>开多当月(c1)+开空隔季(c4)。<br>
+<b>出场/换月</b>：仅当<b>当月腿距到期≤3交易日换月</b>；<b>持仓期间不因贴水变浅主动平仓</b>（吃满展期收益）。<br>
+<b>本金50万</b>，每对保证金约24万，盯市用收盘价。结构上当月合约常年贴水指数，无需额外基差过滤。"""
+im = build_block('IM',im_st,im_td,im_e2,im_corr,'IM 近月-隔季（深贴水分位≥0.20）',im_rule,252,0.20,im_sr,im_pct,im_pos)
 
-# IM: 远月-隔季 i1_i3, W120, 深贴水分位>=0.40，且近月必须贴水
-im_st,im_td,im_eq,im_e2,im_corr,_,_,im_sr,im_pct,im_pos = run_pair('IM','i1_i3',120,0.40,require_basis=True)
-im_rule = """<b>品种</b>：中证1000股指期货（IM）｜<b>组合</b>：<b>远月-隔季 = 多下月(c2) + 空隔季(c4)</b>，1:1 锁合约，各1手<br>
-（说明：组合名中的"远月"即"下月/次月" c2，不是当月 c1；隔季是再下一个季月 c4。）<br>
-<b>入场</b>：spread_rel=(下月收盘−隔季收盘)/下月收盘，取滚动120日分位；当<b>分位≥0.40（深贴水）</b>时，于<b>次日开盘</b>开多下月(c2)+开空隔季(c4)。<br>
-<b>关键风控</b>：开仓前必须确认<b>下月合约本身相对中证1000指数处于贴水</b>（下月价 &lt; 中证1000指数价）。此过滤用于排除“下月升水、隔季深贴水”的危险结构——那种情况价差虽大，但多下月吃不到贴水。历史中 IM 满足分位时 99.8% 已自然满足该条件。<br>
-<b>出场</b>：仅当<b>下月腿距到期≤10交易日换月</b>；<b>持仓期间不因贴水变浅主动平仓</b>（吃满展期收益）。<br>
-<b>换月</b>：平仓原两合约，按同样规则重新开新下月(c2)+新隔季(c4)。<b>本金50万</b>，每对保证金约24万，盯市用收盘价。"""
-im = build_block('IM',im_st,im_td,im_e2,im_corr,'IM 远月-隔季（深贴水分位≥0.40）',im_rule,120,0.40,im_sr,im_pct,im_pos)
-
-# IC: 远月-隔季 i1_i3, 纯持有
-ic_st,ic_td,ic_eq,ic_e2,ic_corr,_,_,ic_sr,ic_pct,ic_pos = run_pair('IC','i1_i3',252,None)
-ic_rule = """<b>品种</b>：中证500股指期货（IC）｜<b>组合</b>：<b>远月-隔季 = 多下月(c2) + 空隔季(c4)</b>，1:1 锁合约，各1手<br>
-（说明：组合名中的"远月"即"下月/次月" c2，不是当月 c1；隔季是再下一个季月 c4。）<br>
-<b>入场</b>：<b>纯持有</b>，回测起点即开仓并始终在场（IC 贴水结构稳定，过滤反而踏空）；于<b>次日开盘</b>开多下月(c2)+开空隔季(c4)。<br>
-<b>风控说明</b>：虽为纯持有，但实盘换月开仓前仍需扫一眼<b>下月合约是否相对中证500指数贴水</b>；若出现极端升水结构，可暂停一次换月、空仓观望。<br>
-<b>出场</b>：仅当<b>下月腿距到期≤10交易日换月</b>；<b>全持仓周期不主动平仓</b>。<br>
-<b>换月</b>：平仓原两合约，无缝接新下月(c2)+新隔季(c4)。<b>本金50万</b>，每对保证金约24万，盯市用收盘价。"""
-ic = build_block('IC',ic_st,ic_td,ic_e2,ic_corr,'IC 远月-隔季（纯持有）',ic_rule,252,None,ic_sr,ic_pct,ic_pos)
+# IC: 近月-隔季 i0_i3 = 多当月(c1)+空隔季(c4), W500, 深贴水分位>=0.40
+ic_st,ic_td,ic_eq,ic_e2,ic_corr,_,_,ic_sr,ic_pct,ic_pos = run_pair('IC','i0_i3',500,0.40,require_basis=False,rb=3)
+ic_rule = """<b>品种</b>：中证500股指期货（IC）｜<b>组合</b>：<b>近月-隔季 = 多当月(c1) + 空隔季(c4)</b>，1:1 锁合约，各1手<br>
+（说明：c1=当月合约，c4=隔季合约；IC 整体弱于 IM，本组合为 IC 中风险收益最优区。）<br>
+<b>入场</b>：spread_rel=(当月收盘−隔季收盘)/当月收盘，取滚动500日分位；当<b>分位≥0.40（深贴水）</b>时，于<b>次日开盘</b>开多当月(c1)+开空隔季(c4)。<br>
+<b>出场/换月</b>：仅当<b>当月腿距到期≤3交易日换月</b>；<b>持仓期间不主动平仓</b>。<br>
+<b>本金50万</b>，每对保证金约24万，盯市用收盘价。"""
+ic = build_block('IC',ic_st,ic_td,ic_e2,ic_corr,'IC 近月-隔季（深贴水分位≥0.40）',ic_rule,500,0.40,ic_sr,ic_pct,ic_pos)
 
 # ---------------- 实时操作提示（联网） ----------------
 try:
@@ -336,10 +352,11 @@ td.l, .th.l { text-align:left; }
 </style></head>
 <body><div class="wrap">
 <h1>股指期货跨期展期策略 · IM / IC 最推荐实操页</h1>
-<div class="sub">本质：1:1 多下月(c2)+空隔季(c4)吃贴水收敛（展期收益），指数 delta 中性 ｜ 本金50万、1手、open进close出、仅换月平仓 ｜ 回测区间 IM 2022-07 起 / IC 2015-04 起</div>
+<div class="sub">本质：1:1 多当月(c1)+空隔季(c4)吃贴水收敛（展期收益），指数 delta 中性 ｜ 本金50万、1手、open进close出、仅换月平仓 ｜ 回测区间 IM 2022-07 起 / IC 2015-04 起</div>
 
-<div class="note">两个品种均选 <b>远月-隔季（i1_i3 = c2-c4）</b> 组合：多下月/次月(c2) + 空隔季(c4)。IM 在深贴水时分位过滤入场，IC 始终纯持有。<br>
-<b>分位是什么</b>：图中"价差率"=(下月收盘−隔季收盘)/下月收盘，反映贴水深度；"分位"是该价差率的滚动百分位（越高=贴水越深）。IM 在分位≥0.40 时入场开仓。<br>
+<div class="note">两个品种均选 <b>近月-隔季（i0_i3 = c1-c4）</b> 组合：多当月(c1) + 空隔季(c4)。这是无未来函数全参数网格扫描下的最优组合（旧版锁的远月-隔季 i1_i3 年化仅约一半）。IM 在深贴水时分位过滤入场，IC 同样分位过滤。<br>
+<b>分位是什么</b>：图中"价差率"=(当月收盘−隔季收盘)/当月收盘，反映贴水深度；"分位"是该价差率的滚动百分位（越高=贴水越深）。IM 分位≥0.20、IC 分位≥0.40 时入场开仓。<br>
+<b>标记说明</b>：<span style="color:#ff8c42;">◆橙色菱形</span>=<b>信号触发日</b>（T日收盘达到阈值）；<span style="color:#41d18b;">▲绿三角</span>=<b>开仓成交日</b>（T+1开盘）；<span style="color:#ff5050;">▼红三角</span>=<b>平仓成交日</b>（换月日收盘）。信号日与成交日相差一个交易日，正是"无未来函数"的保证。<br>
 <b>操作提示</b>：下方卡片基于生成时的联网行情，给出明天/下次交易日的明确操作（开仓合约、价差阈值、换月倒计时）。<br>
 <b>公网页面数据更新</b>：本页为静态快照，历史走势/回测结果需每日重新生成后部署；实时信号卡片在公网可能受行情源跨域限制无法自动刷新。需要 7×24 小时自动更新请配置服务端定时任务（如 GitHub Actions）。</div>
 
@@ -382,19 +399,25 @@ function renderChart(domId, d, name, enterHigh, holdPeriods){
   var chart=echarts.init(el, null, {renderer:'canvas'});
   var thr = (enterHigh!=null) ? enterHigh : null;
   var holdData = (holdPeriods||[]).map(function(p){return [{name:'持仓区间',xAxis:p[0],label:{show:false,position:'top'}},{xAxis:p[1]}];});
-  var series=[
+    var series=[
     {name:name+'账户净值(万)',type:'line',xAxisIndex:0,yAxisIndex:0,data:d.nav,showSymbol:false,lineStyle:{width:1.6,color:'#ffd479'},
       markArea:{silent:true,itemStyle:{color:'rgba(65,209,139,0.12)'},data:holdData}},
     {name:name+'主连',type:'line',xAxisIndex:0,yAxisIndex:1,data:d.mc,showSymbol:false,lineStyle:{width:1,color:'#5aa9ff',type:'dashed'}},
     {name:'价差率%',type:'line',xAxisIndex:1,yAxisIndex:2,data:d.spread,showSymbol:false,lineStyle:{width:1.2,color:'#f0a030'}},
     {name:'分位',type:'line',xAxisIndex:2,yAxisIndex:3,data:d.pct,showSymbol:false,lineStyle:{width:1.2,color:'#c79bff'},
       markLine: thr!=null ? {silent:true,symbol:'none',data:[{yAxis:thr,lineStyle:{color:'#41d18b',type:'dashed'},label:{formatter:'入场阈值'+thr,color:'#41d18b',fontSize:10}}]} : undefined},
-    {name:'回撤',type:'line',xAxisIndex:3,yAxisIndex:4,data:d.dd,showSymbol:false,lineStyle:{color:'#ff5050',width:1},areaStyle:{color:'rgba(255,80,80,0.22)'}}
+    {name:'回撤',type:'line',xAxisIndex:3,yAxisIndex:4,data:d.dd,showSymbol:false,lineStyle:{color:'#ff5050',width:1},areaStyle:{color:'rgba(255,80,80,0.22)'}},
+    {name:'触发信号日',type:'scatter',xAxisIndex:2,yAxisIndex:3,data:d.signal_pct,symbol:'diamond',symbolSize:10,itemStyle:{color:'#ff8c42'},z:6,
+      tooltip:{trigger:'item',formatter:function(p){return '触发信号日<br>分位 '+p.value;}}},
+    {name:'成交·开仓',type:'scatter',xAxisIndex:0,yAxisIndex:0,data:d.entry_nav,symbol:'triangle',symbolSize:13,itemStyle:{color:'#41d18b'},z:6,
+      tooltip:{trigger:'item',formatter:function(p){return '开仓成交日(T+1开盘)';}}},
+    {name:'成交·平仓',type:'scatter',xAxisIndex:0,yAxisIndex:0,data:d.exit_nav,symbol:'triangle',symbolSize:13,symbolRotate:180,itemStyle:{color:'#ff5050'},z:6,
+      tooltip:{trigger:'item',formatter:function(p){return '平仓成交日(换月收盘)';}}}
   ];
   var opt={
     backgroundColor:'transparent',
     tooltip:{trigger:'axis'},
-    legend:{data:[name+'账户净值(万)', name+'主连','价差率%','分位'], textStyle:{color:'#cfd5e0'}, top:0},
+    legend:{data:[name+'账户净值(万)', name+'主连','价差率%','分位','触发信号日','成交·开仓','成交·平仓'], textStyle:{color:'#cfd5e0'}, top:0, type:'scroll', width:'92%'},
     axisPointer:{link:[{xAxisIndex:'all'}]},
     grid:[
       {left:58,right:64,top:42,height:'38%'},
@@ -573,7 +596,7 @@ function renderSignal(){
     var thrtxt = x.enter_high!=null ? ('入场分位阈值 <b>'+x.enter_high+'</b>') : '纯持有（无分位过滤）';
     var statusBadge = '<span style="display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;background:'+(x.is_holding?'#1d4e6f;color:#5aa9ff':'#3d2f1d;color:#ffb347')+'">'+x.holding_status+'</span>';
     html+='<div class="sig-box '+cls+'">'+
-      '<div class="sig-prod">'+prod+' · 远月-隔季（'+x.near+' / '+x.far+'） '+statusBadge+'</div>'+
+      '<div class="sig-prod">'+prod+' · 近月-隔季（'+x.near+' / '+x.far+'） '+statusBadge+'</div>'+
       '<div class="sig-act">'+x.action+'</div>'+
       '<div class="sig-detail">'+
         '最新价：'+x.near+'=<b>'+x.near_px+'</b> ， '+x.far+'=<b>'+x.far_px+'</b><br>'+
@@ -589,22 +612,18 @@ renderSignal();
 refreshSignal();
 setInterval(refreshSignal, 30000);
 renderCard(DATA.im,'im'); renderCard(DATA.ic,'ic');
-renderChart('im_chart', DATA.im, 'IM', 0.40, DATA.im.hold_periods);
-renderChart('ic_chart', DATA.ic, 'IC', null, DATA.ic.hold_periods);
+renderChart('im_chart', DATA.im, 'IM', 0.20, DATA.im.hold_periods);
+renderChart('ic_chart', DATA.ic, 'IC', 0.40, DATA.ic.hold_periods);
 renderTable('im_tbl', DATA.im.trades);
 renderTable('ic_tbl', DATA.ic.trades);
 </script></body></html>"""
 
 echarts_js = open('echarts.min.js', encoding='utf-8').read()
 html = TEMPLATE.replace('@@ECHARTS@@', echarts_js).replace('@@DATA@@', DATA_JSON)
-out = '股指跨期展期策略_IM_IC推荐实操页.html'
+out = 'public/index.html'
 with open(out,'w',encoding='utf-8') as f:
     f.write(html)
-import os as _os2
-_os2.makedirs('public', exist_ok=True)
-with open('public/index.html','w',encoding='utf-8') as f:
-    f.write(html)
-print('已生成:', out, '及 public/index.html')
+print('已生成:', out)
 print('IM:', im['metrics'])
 print('IC:', ic['metrics'])
 print('信号OK:', DATA['signal_ok'])
