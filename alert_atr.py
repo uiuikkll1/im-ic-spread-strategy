@@ -1,16 +1,22 @@
+# -*- coding: utf-8 -*-
 """
 ATR 突破策略 —— 收盘后信号推送（Server酱 → 微信）
 参数（用户报告 top1）：MA2 / ATR20 / 倍数0.6 / 实体0，无止盈止损
+ATR 用 Wilder 平滑（与回测 top1 口径一致）。
+
 逻辑：T 日收盘判断 → T+1 日开盘执行。
 【推送时机：只在状态切换时推一次】
   - 空仓 & 突破上轨   → 推「买入」（次日开盘）
   - 持仓 & 跌破 MA    → 推「卖出」（次日开盘离场）
   - 持仓中未触发卖出  → 不推（不打扰）
   - 空仓未突破        → 不推
+
 【防漏推措施】
-  1) 幂等守卫：用「最新数据日期」标记已处理，重复跑/双 cron 不重复推
+  1) 幂等守卫：用「北京时间运行日期」标记已处理，当天双 cron 不重复推
   2) 数据拉取失败自动重试 3 次，并回退备用数据源
-  3) workflow 双 cron（19:00 + 20:00 北京时间）+ 幂等，单日被跳过也能补跑
+  3) 推送失败 → 保留旧状态、不标记已处理 → 下次重试
+  4) 顶层异常兜底 → 推告警、不标记已处理（下次重试）
+  5) workflow 双 cron（19:00 + 20:00 北京时间）+ concurrency 防并发双推
 """
 import os
 import json
@@ -37,7 +43,7 @@ def load_state():
         s = json.load(open(STATE_FILE, "r", encoding="utf-8"))
         return int(s.get("holding", 0)), str(s.get("processed_date", ""))
     except Exception:
-        return 0, ""   # 0=空仓, 1=持仓；processed_date=已处理的数据日期
+        return 0, ""   # 0=空仓, 1=持仓；processed_date=已处理的运行日期
 
 
 def save_state(holding, processed_date):
@@ -48,13 +54,17 @@ def save_state(holding, processed_date):
 
 
 def fetch_index():
-    """主源带重试；全部失败回退备用源。"""
+    """主源带重试；全部失败回退备用源。返回标准化列 date/Open/High/Low/Close。"""
     last_err = None
     for attempt in range(3):
         try:
             df = ak.stock_zh_index_daily(symbol=SYMBOL)
             if df is not None and len(df) > ATR_N + 5:
+                df = df.rename(columns={"date": "date", "open": "Open", "high": "High",
+                                        "low": "Low", "close": "Close", "volume": "Volume"})
+                print(f"[fetch] 主源成功，{len(df)} 行")
                 return df
+            last_err = "主源返回空或行数不足"
         except Exception as e:
             last_err = e
             print(f"[fetch] 主源 attempt {attempt+1}/3 失败: {e}")
@@ -74,22 +84,28 @@ def fetch_index():
     raise RuntimeError(f"指数数据拉取失败: {last_err}")
 
 
+def wilder_atr(high, low, close, n):
+    prev = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
+    tr = tr.to_numpy(dtype=float)
+    atr = np.full(len(tr), np.nan)
+    if len(tr) > n:
+        atr[n - 1] = tr[:n].mean()
+        for i in range(n, len(tr)):
+            atr[i] = (atr[i - 1] * (n - 1) + tr[i]) / n
+    return pd.Series(atr, index=close.index)
+
+
 def compute_signal():
     df = fetch_index()
-    df = df.rename(columns={"date": "date", "open": "Open", "high": "High",
-                            "low": "Low", "close": "Close", "volume": "Volume"})
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
 
     close = df["Close"]
     ma = close.rolling(MA_N).mean()
-    hl = df["High"] - df["Low"]
-    hc = (df["High"] - close.shift()).abs()
-    lc = (df["Low"] - close.shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    atr = tr.rolling(ATR_N).mean()
+    atr = wilder_atr(df["High"], df["Low"], close, ATR_N)
     upper = ma + MULT * atr
-    body = (df["Close"] - df["Open"]).abs() / df["Open"]
+    body = (close - df["Open"]).abs() / df["Open"]
 
     i = -1
     d = df["date"].iloc[i]
@@ -98,6 +114,10 @@ def compute_signal():
     up = float(upper.iloc[i])
     m = float(ma.iloc[i])
     b = float(body.iloc[i])
+
+    # M5：数据新鲜度与有效性校验，避免 NaN/半截 bar 导致误判
+    if not (c > 0 and not pd.isna(up) and not pd.isna(m) and not pd.isna(b)):
+        raise RuntimeError(f"最新行情无效：date={d}, close={c}, up={up}, ma={m}, body={b}")
 
     buy_trig = (c > up) and (b >= BODY_THR)
     sell_trig = (c < m)
@@ -135,30 +155,33 @@ def push_wechat(title, desp):
         return False
 
 
-def main():
+def run_core():
+    run_day = dt.date.today()              # TZ 已在 workflow 设为 Asia/Shanghai
+    run_str = run_day.isoformat()
+
     holding, processed = load_state()
+    # 防漏推 1：该运行日期已处理过（重复跑/双 cron/重试）则跳过
+    if processed == run_str:
+        print(f"{run_str} 已处理过（防重复推送），跳过")
+        return
+
     d, c, o, up, m, b, buy_trig, sell_trig = compute_signal()
     d_str = f"{d:%Y-%m-%d}"
-
-    # 防漏推 1：该数据日期已处理过（重复跑/双 cron/重试）则跳过，避免重复推送
-    if processed == d_str:
-        print(f"{d_str} 数据已处理过（防重复推送），跳过")
-        return
 
     msg = None
     new_state = holding
 
     if holding == 0:                       # 当前空仓
         if buy_trig:
-            msg = (f"【ATR 买入信号】{d_str}\n"
-                   f"中证1000 收盘 {c:.2f} > 上轨 {up:.2f}（MA{MA_N}+{MULT}×ATR{ATR_N}），实体比 {b:.3f}≥{BODY_THR}\n"
+            msg = (f"【ATR 买入信号】{d_str}\n\n"
+                   f"中证1000 收盘 {c:.2f} > 上轨 {up:.2f}（MA{MA_N}+{MULT}×ATR{ATR_N}），实体比 {b:.3f}≥{BODY_THR}\n\n"
                    f"→ 次日开盘买入")
             new_state = 1
         # 否则：空仓未突破，不推
     else:                                  # 当前持仓
         if sell_trig:
-            msg = (f"【ATR 卖出信号】{d_str}\n"
-                   f"中证1000 收盘 {c:.2f} < MA{MA_N} {m:.2f}\n"
+            msg = (f"【ATR 卖出信号】{d_str}\n\n"
+                   f"中证1000 收盘 {c:.2f} < MA{MA_N} {m:.2f}\n\n"
                    f"→ 次日开盘离场")
             new_state = 0
         # 否则：持仓中未触发卖出，不推（不打扰）
@@ -166,13 +189,39 @@ def main():
     if msg:
         ok = push_wechat("ATR突破策略信号", msg)
         if ok:
-            save_state(new_state, d_str)            # 推送成功才标记该数据日期已处理
+            # C2：只有推送成功才写新状态 + 标记已处理
+            save_state(new_state, run_str)
         else:
-            save_state(new_state, processed)        # 推送失败保留旧 processed_date，下次重试
-            print(f"{d_str} 推送失败，不标记已处理，下次继续尝试")
+            # 推送失败：保留旧状态（holding 不变），不标记已处理，下次重试
+            save_state(holding, processed)
+            print(f"{run_str} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
     else:
-        save_state(new_state, d_str)                # 无信号日也要标记，避免重复跑空
-        print(f"{d_str} 无信号（holding={holding}）")
+        # 无信号日：不翻转状态，仅标记该日已处理（避免重复跑空）
+        save_state(holding, run_str)
+        print(f"{run_str} 无信号（holding={holding}）")
+
+
+def main():
+    try:
+        run_core()
+    except Exception as e:
+        err = f"ATR 信号系统异常：{e}"
+        print(err)
+        st = load_state.__wrapped__ if False else None
+        try:
+            st = json.load(open(STATE_FILE, "r", encoding="utf-8"))
+        except Exception:
+            st = {}
+        today = dt.date.today().isoformat()
+        if st.get("alerted_date") != today:
+            try:
+                push_wechat("⚠️ ATR 信号系统异常", err)
+            except Exception:
+                pass
+            st["alerted_date"] = today
+            json.dump(st, open(STATE_FILE, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=2)
+        # 不标记 processed_date → 下次运行继续重试
 
 
 if __name__ == "__main__":
