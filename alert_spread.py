@@ -10,7 +10,7 @@ IM/IC 跨期展期策略 —— 每日收盘后推送「明日操作」到微信
 有消息才推。
 
 【防漏推措施】
-  1) 幂等守卫：用「北京时间运行日期」标记已处理，当天双 cron 不重复推
+  1) 幂等守卫：按品种各存「数据日」(IM_key / IC_key)，同一根K线只推一次；双 cron/周末/重试不重复推
   2) 分位信号基于连续价差面板序列（先刷新原始数据+重建面板，失败回退旧面板），
      绝不从单个月份合约历史价算长窗口分位（月份合约寿命仅 1~2 月，历史不足）
   3) 推送失败 → 保留旧状态、不标记已处理 → 下次重试
@@ -32,6 +32,22 @@ from spread_hold_lib import contract_last_trade_day
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "")
 STATE_FILE = "spread_state.json"
 ROLL_BUF = 10   # 距到期≤10交易日进入换月窗口（与用户需求/实操页一致）
+STALE_TD = 5     # 面板末行距运行日超过 5 个交易日即视为数据滞后，发告警
+
+
+def trading_days_between(start_iso, end_iso):
+    """两个 ISO 日期之间的交易日数量（含 end，不含 start），用于数据新鲜度判断。"""
+    s = dt.date.fromisoformat(start_iso)
+    e = dt.date.fromisoformat(end_iso)
+    if e <= s:
+        return 0
+    cnt = 0
+    d = s + dt.timedelta(days=1)
+    while d <= e:
+        if d.weekday() < 5:
+            cnt += 1
+        d += dt.timedelta(days=1)
+    return cnt
 
 
 def load_state():
@@ -125,29 +141,36 @@ def run_core():
     # 先刷新面板（失败回退旧面板），保证分位基于最新连续序列
     refresh_panels()
 
-    # 取两品种的数据日（面板末行日期）作为幂等键：
-    # 双 cron 跨午夜(23:00/00:00)与周末看到的都是同一根K线，第二次应跳过，不重复推。
-    qdates = []
+    run_day = dt.date.today()           # TZ 已在 workflow 设为 Asia/Shanghai
+    gen_date = run_day.isoformat()
+
+    # 逐品种算分位；失败的记下来单独告警，不拖累另一个品种
     pct_map = {}
+    failed = []
     for prod in ["IM", "IC"]:
         W, _enter_high, _idx = PARAMS[prod]
         try:
             cur_pct, qdate, pnear, pfar, nlast, flast = compute_pct(prod, W)
             pct_map[prod] = (cur_pct, qdate, pnear, pfar, nlast, flast)
-            qdates.append(qdate)
         except Exception as e:
+            failed.append(prod)
             print(f"[{prod}] 分位计算失败: {e}")
-    if not qdates:
-        print("两品种分位均计算失败，本次不推送（保留旧状态，下次重试）")
-        return
-    sig_key = "|".join(sorted(set(qdates)))
 
-    if state.get("processed_key") == sig_key:
-        print(f"数据日 {sig_key} 已处理（防重复推送），跳过")
+    # 数据缺失告警（每日最多一次）：某个品种数据坏了，用户至少知道，不会静默丢信号
+    if failed and state.get("broken_alerted_date") != gen_date:
+        push_wechat("⚠️ IM/IC 数据缺失告警",
+                    f"{'、'.join(failed)} 分位计算失败，今日不推送该品种（其余正常），请检查数据源")
+        state["broken_alerted_date"] = gen_date
+
+    if not pct_map:
+        print("两品种分位均计算失败，本次不推送（保留旧状态，下次重试）")
+        save_state(state)
         return
 
     parts = []
     results = {}
+    evaluated = {}          # 本批实际评估过的品种 -> 数据日（推送成功才标记键）
+    stale_msgs = []
     for prod in ["IM", "IC"]:
         if prod not in pct_map:
             continue
@@ -156,9 +179,11 @@ def run_core():
         # 杜绝 current_c1_c4 推导与面板不一致导致的错单（如把隔季算成下季）。
         near, far = pnear, pfar
         W, enter_high, _idx = PARAMS[prod]
-        today = dt.date.today()             # TZ 已在 workflow 设为 Asia/Shanghai
+
+        # 换月窗口用「数据日(面板末行)」而非「运行日」，消除双 cron 跨午夜的口径漂移
+        qday = dt.date.fromisoformat(qdate)
         ltd = contract_last_trade_day(near).date()
-        d = today
+        d = qday
         cnt = 0
         while d <= ltd:
             if d.weekday() < 5:
@@ -166,6 +191,17 @@ def run_core():
             d += dt.timedelta(days=1)
         in_roll = cnt <= ROLL_BUF
 
+        # 数据新鲜度：面板末行距运行日超过阈值交易日 → 告警（否则数据源一挂就无声死掉）
+        tdiff = trading_days_between(qdate, gen_date)
+        if tdiff > STALE_TD:
+            stale_msgs.append(f"{prod} 面板数据滞后 {tdiff} 个交易日（末行 {qdate}），信号可能基于旧数据")
+
+        # 按品种独立幂等：该品种此数据日已处理过 → 跳过（不重推、不重评）
+        if state.get(f"{prod}_key") == qdate:
+            print(f"{prod}: 数据日 {qdate} 已处理，跳过")
+            continue
+
+        evaluated[prod] = qdate
         holding = int(state.get(prod, 0))
         new_h = holding
         msg = None
@@ -194,20 +230,26 @@ def run_core():
         else:
             print(f"{prod}: 持仓中/换月窗口，不推送")
 
+    # 数据滞后告警（每日最多一次）
+    if stale_msgs and state.get("stale_alerted_date") != gen_date:
+        push_wechat("⚠️ IM/IC 数据滞后告警", "\n".join(stale_msgs))
+        state["stale_alerted_date"] = gen_date
+
     if parts:
-        desp = f"生成日期：{sig_key}\n\n" + "\n\n".join(parts)
+        desp = f"生成日期：{gen_date}\n\n" + "\n\n".join(parts)
         ok = push_wechat("IM/IC 跨期展期 明日操作", desp)
         if ok:
-            # 只有推送成功才写新状态 + 标记已处理（数据日）
+            # 只有推送成功才写新状态 + 标记各品种已处理数据日
             state.update(results)
-            state["processed_key"] = sig_key
+            for p, q in evaluated.items():
+                state[f"{p}_key"] = q
         else:
             # 推送失败：保留旧状态，不标记已处理，下次重试
-            print(f"数据日 {sig_key} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
+            print(f"数据日 {gen_date} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
     else:
-        # 无操作日：不翻转状态，仅标记该数据日已处理（避免重复跑空/周末噪音）
-        print(f"数据日 {sig_key} IM/IC 均无操作，标记已处理避免重复跑空")
-        state["processed_key"] = sig_key
+        # 无操作日：不翻转持仓，但评估过的品种标记数据日（避免重复跑空/周末噪音）
+        for p, q in evaluated.items():
+            state[f"{p}_key"] = q
 
     save_state(state)
 

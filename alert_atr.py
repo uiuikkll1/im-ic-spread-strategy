@@ -12,7 +12,7 @@ ATR 用 Wilder 平滑（与回测 top1 口径一致）。
   - 空仓未突破        → 不推
 
 【防漏推措施】
-  1) 幂等守卫：用「北京时间运行日期」标记已处理，当天双 cron 不重复推
+  1) 幂等守卫：用「数据日(最后交易日的K线日期)」标记已处理，双 cron/周末/重试看到同一根K线只推一次
   2) 数据拉取失败自动重试 3 次，并回退备用数据源
   3) 推送失败 → 保留旧状态、不标记已处理 → 下次重试
   4) 顶层异常兜底 → 推告警、不标记已处理（下次重试）
@@ -46,8 +46,8 @@ def load_state():
         return 0, ""   # 0=空仓, 1=持仓；processed_key=已处理的数据日(最后交易日的K线)
 
 
-def save_state(holding, processed_date):
-    json.dump({"holding": holding, "processed_date": processed_date,
+def save_state(holding, processed_key):
+    json.dump({"holding": holding, "processed_key": processed_key,
                "updated": str(dt.date.today())},
               open(STATE_FILE, "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
@@ -209,7 +209,7 @@ def main():
         try:
             st = json.load(open(STATE_FILE, "r", encoding="utf-8"))
         except Exception:
-            st = {}
+            st = {"holding": 0, "processed_key": ""}
         today = dt.date.today().isoformat()
         if st.get("alerted_date") != today:
             try:
