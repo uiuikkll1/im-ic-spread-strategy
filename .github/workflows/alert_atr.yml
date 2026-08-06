@@ -6,6 +6,10 @@ on:
     - cron: '0 11,12 * * *'      # 11:00/12:00 UTC = 19:00/20:00 北京时间
   workflow_dispatch:           # 允许在 Actions 页面手动触发测试
 
+concurrency:
+  group: alert-atr
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
