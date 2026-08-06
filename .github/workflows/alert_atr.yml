@@ -29,10 +29,12 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore alert state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: atr_state.json
-          key: atr-state
+          key: atr-state-${{ github.run_id }}
+          restore-keys: |
+            atr-state-
 
       - name: Run ATR alert (push to WeChat)
         env:
@@ -42,7 +44,7 @@ jobs:
 
       - name: Save alert state
         if: always()
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: atr_state.json
-          key: atr-state
+          key: atr-state-${{ github.run_id }}

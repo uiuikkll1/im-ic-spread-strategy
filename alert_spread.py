@@ -25,7 +25,7 @@ import pandas as pd
 import requests
 
 import akshare as ak
-from live_signal import current_c1_c4, PARAMS
+from live_signal import PARAMS
 import backtest_im_spread as v1
 from spread_hold_lib import contract_last_trade_day
 
@@ -119,63 +119,74 @@ def compute_pct(prod, W):
             float(last["near_close"]), float(last["far_close"]))
 
 
-def analyze(prod, state, run_day):
-    W, enter_high, _idx = PARAMS[prod]
-    today = run_day                         # 用运行日期判断换月窗口
-    near, far = current_c1_c4(prod, today)  # 已过第三个周五会自动滚到下月近月
-
-    # 分位从连续面板序列算（与实操页同一管线）；near/far 用 current_c1_c4 给出真实交易合约
-    cur_pct, qdate, _pnear, _pfar, nlast, flast = compute_pct(prod, W)
-
-    ltd = contract_last_trade_day(near).date()
-    d = today
-    cnt = 0
-    while d <= ltd:
-        if d.weekday() < 5:
-            cnt += 1
-        d += dt.timedelta(days=1)
-    in_roll = cnt <= ROLL_BUF
-
-    holding = int(state.get(prod, 0))
-    new_h = holding
-    msg = None
-
-    if holding:
-        if in_roll:
-            msg = (f"【{prod} 明日】平仓（换月）：平多 {near} + 平空 {far}\n\n"
-                   f"当月距到期 {cnt} 交易日（最后交易日 {ltd}）")
-            new_h = 0
-        # else 持仓中且未到换月：不推
-    else:
-        if not in_roll and cur_pct >= enter_high:
-            msg = (f"【{prod} 明日】开仓：多 {near} + 空 {far}\n\n"
-                   f"分位 {cur_pct:.2f} ≥ {enter_high}，当日价差率 {(nlast - flast) / nlast:.3f}（报价日 {qdate}），次日开盘执行")
-            new_h = 1
-        elif not in_roll:
-            msg = (f"【{prod} 明日】不用开仓\n\n"
-                   f"分位 {cur_pct:.2f} < {enter_high}（报价日 {qdate}），等待更深贴水")
-            new_h = 0
-        # else 空仓且处于换月窗口：不推（避免开快到期/已摘牌合约）
-
-    return msg, new_h, cur_pct, qdate, near, far, cnt
-
-
 def run_core():
-    run_day = dt.date.today()               # TZ 已在 workflow 设为 Asia/Shanghai
-    run_str = run_day.isoformat()
-
     state = load_state()
-    if state.get("processed_date") == run_str:
-        print(f"{run_str} 已处理（防重复推送），跳过")
-        return
 
     # 先刷新面板（失败回退旧面板），保证分位基于最新连续序列
     refresh_panels()
 
+    # 取两品种的数据日（面板末行日期）作为幂等键：
+    # 双 cron 跨午夜(23:00/00:00)与周末看到的都是同一根K线，第二次应跳过，不重复推。
+    qdates = []
+    pct_map = {}
+    for prod in ["IM", "IC"]:
+        W, _enter_high, _idx = PARAMS[prod]
+        try:
+            cur_pct, qdate, pnear, pfar, nlast, flast = compute_pct(prod, W)
+            pct_map[prod] = (cur_pct, qdate, pnear, pfar, nlast, flast)
+            qdates.append(qdate)
+        except Exception as e:
+            print(f"[{prod}] 分位计算失败: {e}")
+    if not qdates:
+        print("两品种分位均计算失败，本次不推送（保留旧状态，下次重试）")
+        return
+    sig_key = "|".join(sorted(set(qdates)))
+
+    if state.get("processed_key") == sig_key:
+        print(f"数据日 {sig_key} 已处理（防重复推送），跳过")
+        return
+
     parts = []
     results = {}
     for prod in ["IM", "IC"]:
-        msg, new_h, pct, qdate, near, far, cnt = analyze(prod, state, run_day)
+        if prod not in pct_map:
+            continue
+        cur_pct, qdate, pnear, pfar, nlast, flast = pct_map[prod]
+        # 直接用面板末行合约作为交易合约，保证「推送合约」与「算分位合约」同源，
+        # 杜绝 current_c1_c4 推导与面板不一致导致的错单（如把隔季算成下季）。
+        near, far = pnear, pfar
+        W, enter_high, _idx = PARAMS[prod]
+        today = dt.date.today()             # TZ 已在 workflow 设为 Asia/Shanghai
+        ltd = contract_last_trade_day(near).date()
+        d = today
+        cnt = 0
+        while d <= ltd:
+            if d.weekday() < 5:
+                cnt += 1
+            d += dt.timedelta(days=1)
+        in_roll = cnt <= ROLL_BUF
+
+        holding = int(state.get(prod, 0))
+        new_h = holding
+        msg = None
+
+        if holding:
+            if in_roll:
+                msg = (f"【{prod} 明日】平仓（换月）：平多 {near} + 平空 {far}\n\n"
+                       f"当月距到期 {cnt} 交易日（最后交易日 {ltd}）")
+                new_h = 0
+            # else 持仓中且未到换月：不推
+        else:
+            if not in_roll and cur_pct >= enter_high:
+                msg = (f"【{prod} 明日】开仓：多 {near} + 空 {far}\n\n"
+                       f"分位 {cur_pct:.2f} ≥ {enter_high}，当日价差率 {(nlast - flast) / nlast:.3f}（报价日 {qdate}），次日开盘执行")
+                new_h = 1
+            elif not in_roll:
+                msg = (f"【{prod} 明日】不用开仓\n\n"
+                       f"分位 {cur_pct:.2f} < {enter_high}（报价日 {qdate}），等待更深贴水")
+                new_h = 0
+            # else 空仓且处于换月窗口：不推（避免开快到期/已摘牌合约）
+
         results[prod] = new_h
         if msg:
             parts.append(msg)
@@ -184,19 +195,19 @@ def run_core():
             print(f"{prod}: 持仓中/换月窗口，不推送")
 
     if parts:
-        desp = f"生成日期：{run_str}\n\n" + "\n\n".join(parts)
+        desp = f"生成日期：{sig_key}\n\n" + "\n\n".join(parts)
         ok = push_wechat("IM/IC 跨期展期 明日操作", desp)
         if ok:
-            # C2：只有推送成功才写新状态 + 标记已处理
+            # 只有推送成功才写新状态 + 标记已处理（数据日）
             state.update(results)
-            state["processed_date"] = run_str
+            state["processed_key"] = sig_key
         else:
             # 推送失败：保留旧状态，不标记已处理，下次重试
-            print(f"{run_str} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
+            print(f"数据日 {sig_key} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
     else:
-        # 无操作日：不翻转状态，仅标记已处理（避免重复跑空）
-        print("今日 IM/IC 均无操作，标记已处理避免重复跑空")
-        state["processed_date"] = run_str
+        # 无操作日：不翻转状态，仅标记该数据日已处理（避免重复跑空/周末噪音）
+        print(f"数据日 {sig_key} IM/IC 均无操作，标记已处理避免重复跑空")
+        state["processed_key"] = sig_key
 
     save_state(state)
 

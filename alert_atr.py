@@ -41,9 +41,9 @@ SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "")
 def load_state():
     try:
         s = json.load(open(STATE_FILE, "r", encoding="utf-8"))
-        return int(s.get("holding", 0)), str(s.get("processed_date", ""))
+        return int(s.get("holding", 0)), str(s.get("processed_key", ""))
     except Exception:
-        return 0, ""   # 0=空仓, 1=持仓；processed_date=已处理的运行日期
+        return 0, ""   # 0=空仓, 1=持仓；processed_key=已处理的数据日(最后交易日的K线)
 
 
 def save_state(holding, processed_date):
@@ -156,17 +156,16 @@ def push_wechat(title, desp):
 
 
 def run_core():
-    run_day = dt.date.today()              # TZ 已在 workflow 设为 Asia/Shanghai
-    run_str = run_day.isoformat()
-
     holding, processed = load_state()
-    # 防漏推 1：该运行日期已处理过（重复跑/双 cron/重试）则跳过
-    if processed == run_str:
-        print(f"{run_str} 已处理过（防重复推送），跳过")
-        return
 
     d, c, o, up, m, b, buy_trig, sell_trig = compute_signal()
     d_str = f"{d:%Y-%m-%d}"
+
+    # 防漏推 1：该数据日(最后交易日的K线)已处理过（重复跑/双 cron/重试/周末）则跳过。
+    # 用数据日而非运行日：双 cron 19:00/20:00 与周末看到的是同一根K线，第二次应跳过。
+    if processed == d_str:
+        print(f"{d_str} 已处理过（防重复推送），跳过")
+        return
 
     msg = None
     new_state = holding
@@ -189,16 +188,16 @@ def run_core():
     if msg:
         ok = push_wechat("ATR突破策略信号", msg)
         if ok:
-            # C2：只有推送成功才写新状态 + 标记已处理
-            save_state(new_state, run_str)
+            # C2：只有推送成功才写新状态 + 标记已处理（数据日）
+            save_state(new_state, d_str)
         else:
             # 推送失败：保留旧状态（holding 不变），不标记已处理，下次重试
             save_state(holding, processed)
-            print(f"{run_str} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
+            print(f"{d_str} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
     else:
-        # 无信号日：不翻转状态，仅标记该日已处理（避免重复跑空）
-        save_state(holding, run_str)
-        print(f"{run_str} 无信号（holding={holding}）")
+        # 无信号日：不翻转状态，仅标记该日已处理（避免重复跑空/周末噪音）
+        save_state(holding, d_str)
+        print(f"{d_str} 无信号（holding={holding}）")
 
 
 def main():

@@ -26,19 +26,22 @@ def current_c1_c4(prod, today=None):
     else:
         m1 = today.month; y1 = today.year
     c1 = (y1 % 100) * 100 + m1
-    # 隔季 = 从 m1+1 起扫描，取第 2 个季月(3/6/9/12)
+    # 隔季 = 挂牌序列第 4 个合约 = 「下月」之后的第 2 个季月(3/6/9/12)
+    # 关键修正：必须从 m1+2 起扫。原代码从 m1+1 起扫，当当月/下月本身是季月
+    # (m1∈{2,5,8,11}) 时，m1+1 会被误记为 idx2，导致取到「下季」而非「隔季」
+    # （如 8 月返回 IM2612，但实操页/真实持仓是 IM2703）。12 个月全覆盖已验证一致。
     qs = []
-    mm = m1 + 1; yy = y1
+    mm = m1 + 2; yy = y1
     if mm > 12:
-        mm = 1; yy += 1
+        mm -= 12; yy += 1
     for _ in range(36):
         if mm in (3, 6, 9, 12):
             qs.append((yy, mm))
+            if len(qs) >= 2:
+                break
         mm += 1
         if mm > 12:
             mm = 1; yy += 1
-        if len(qs) >= 2:
-            break
     q4 = qs[1]
     c4 = (q4[0] % 100) * 100 + q4[1]
     return f'{prod}{c1:04d}', f'{prod}{c4:04d}'
