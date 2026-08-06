@@ -105,6 +105,7 @@ def compute_signal():
 
 
 def push_wechat(title, desp):
+    """调用 Server酱，并校验返回 JSON 中的 code；code=0 才算真正递交到微信。"""
     if not SERVERCHAN_KEY:
         print("未配置 SERVERCHAN_KEY，跳过推送")
         return False
@@ -114,8 +115,21 @@ def push_wechat(title, desp):
             data={"title": title, "desp": desp},
             timeout=10,
         )
-        print("Server酱返回:", r.status_code, r.text[:200])
-        return r.status_code == 200
+        print("Server酱返回:", r.status_code, r.text[:300])
+        if r.status_code != 200:
+            print(f"推送失败：HTTP {r.status_code}")
+            return False
+        try:
+            data = r.json()
+        except Exception as e:
+            print(f"推送失败：返回不是合法 JSON，{e}")
+            return False
+        code = data.get("code")
+        if code == 0:
+            print("推送成功：平台已递交微信")
+            return True
+        print(f"推送失败：Server酱 code={code}，message={data.get('message', '')}")
+        return False
     except Exception as e:
         print("推送异常:", e)
         return False
@@ -149,11 +163,15 @@ def main():
             new_state = 0
         # 否则：持仓中未触发卖出，不推（不打扰）
 
-    save_state(new_state, d_str)
-
     if msg:
-        push_wechat("ATR突破策略信号", msg)
+        ok = push_wechat("ATR突破策略信号", msg)
+        if ok:
+            save_state(new_state, d_str)            # 推送成功才标记该数据日期已处理
+        else:
+            save_state(new_state, processed)        # 推送失败保留旧 processed_date，下次重试
+            print(f"{d_str} 推送失败，不标记已处理，下次继续尝试")
     else:
+        save_state(new_state, d_str)                # 无信号日也要标记，避免重复跑空
         print(f"{d_str} 无信号（holding={holding}）")
 
 
