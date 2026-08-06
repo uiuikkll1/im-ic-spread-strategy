@@ -2,7 +2,8 @@ name: IM-IC Spread WeChat Alert
 
 on:
   schedule:
-    - cron: '0 15 * * *'        # 每天 15:00 UTC = 23:00 北京时间（确保含当天期货收盘数据）
+    # 双 cron 兜底：23:00 + 00:00 北京时间各跑一次，单次被跳过另一次能补上
+    - cron: '0 15,16 * * *'      # 15:00/16:00 UTC = 23:00/00:00 北京时间
   workflow_dispatch:
 
 permissions:
