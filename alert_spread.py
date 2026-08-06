@@ -99,15 +99,34 @@ def analyze(prod, state):
 
 
 def push_wechat(title, desp):
+    """调用 Server酱，并校验返回 JSON 中的 code；code=0 才算真正递交到微信。"""
     if not SERVERCHAN_KEY:
         print("未配置 SERVERCHAN_KEY，跳过推送")
-        return
-    r = requests.post(
-        f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send",
-        data={"title": title, "desp": desp},
-        timeout=10,
-    )
-    print("Server酱返回:", r.status_code, r.text[:120])
+        return False
+    try:
+        r = requests.post(
+            f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send",
+            data={"title": title, "desp": desp},
+            timeout=10,
+        )
+        print("Server酱返回:", r.status_code, r.text[:300])
+        if r.status_code != 200:
+            print(f"推送失败：HTTP {r.status_code}")
+            return False
+        try:
+            data = r.json()
+        except Exception as e:
+            print(f"推送失败：返回不是合法 JSON，{e}")
+            return False
+        code = data.get("code")
+        if code == 0:
+            print("推送成功：平台已递交微信")
+            return True
+        print(f"推送失败：Server酱 code={code}，message={data.get('message', '')}")
+        return False
+    except Exception as e:
+        print("推送异常:", e)
+        return False
 
 
 def main():
@@ -129,15 +148,18 @@ def main():
         else:
             print(f"{prod}: 持仓中，不推送")
 
-    state["processed_date"] = as_of
-    save_state(state)
-
-    if not parts:
+    if parts:
+        desp = f"数据日期：{as_of}\n\n" + "\n\n".join(parts)
+        ok = push_wechat("IM/IC 跨期展期 明日操作", desp)
+        if ok:
+            state["processed_date"] = as_of            # 推送成功才标记该数据日期已处理
+        else:
+            print(f"{as_of} 推送失败，不标记已处理，下次继续尝试")
+    else:
         print("今日 IM/IC 均无操作，跳过推送")
-        return
+        state["processed_date"] = as_of                # 无操作日也要标记，避免重复跑空
 
-    desp = f"数据日期：{as_of}\n\n" + "\n\n".join(parts)
-    push_wechat("IM/IC 跨期展期 明日操作", desp)
+    save_state(state)
 
 
 if __name__ == "__main__":
