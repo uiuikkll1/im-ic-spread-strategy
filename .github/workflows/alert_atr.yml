@@ -2,7 +2,8 @@ name: ATR Strategy WeChat Alert
 
 on:
   schedule:
-    - cron: '0 11 * * *'        # 每天 11:00 UTC = 19:00 北京时间（收盘后数据已更新）
+    # 双 cron 兜底：19:00 + 20:00 北京时间各跑一次，单次被跳过另一次能补上
+    - cron: '0 11,12 * * *'      # 11:00/12:00 UTC = 19:00/20:00 北京时间
   workflow_dispatch:           # 允许在 Actions 页面手动触发测试
 
 permissions:
