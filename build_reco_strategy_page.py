@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """生成 IM/IC 各自最推荐跨期展期策略的实操页：
 规则 + 实时操作提示卡片 + 走势图(净值/主连/价差率/分位/回撤) + 成交流水明细。"""
-import pandas as pd, numpy as np, json, datetime as dt
+import pandas as pd, numpy as np, json, datetime as dt, os
 import backtest_im_spread as v1
 from spread_hold_lib import build_px, run_hold, MULT, contract_last_trade_day, _trading_days_between
 import live_signal as ls
@@ -621,6 +621,9 @@ renderTable('ic_tbl', DATA.ic.trades);
 echarts_js = open('echarts.min.js', encoding='utf-8').read()
 html = TEMPLATE.replace('@@ECHARTS@@', echarts_js).replace('@@DATA@@', DATA_JSON)
 out = 'public/index.html'
+_d = os.path.dirname(out)
+if _d:
+    os.makedirs(_d, exist_ok=True)
 with open(out,'w',encoding='utf-8') as f:
     f.write(html)
 print('已生成:', out)
