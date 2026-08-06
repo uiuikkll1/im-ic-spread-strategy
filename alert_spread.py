@@ -157,10 +157,12 @@ def run_core():
             print(f"[{prod}] 分位计算失败: {e}")
 
     # 数据缺失告警（每日最多一次）：某个品种数据坏了，用户至少知道，不会静默丢信号
+    # 注意：推送失败则不写去重键 → 下次重试（与主信号同样严格，避免告警静默丢失）
     if failed and state.get("broken_alerted_date") != gen_date:
-        push_wechat("⚠️ IM/IC 数据缺失告警",
-                    f"{'、'.join(failed)} 分位计算失败，今日不推送该品种（其余正常），请检查数据源")
-        state["broken_alerted_date"] = gen_date
+        ok = push_wechat("⚠️ IM/IC 数据缺失告警",
+                         f"{'、'.join(failed)} 分位计算失败，今日不推送该品种（其余正常），请检查数据源")
+        if ok:
+            state["broken_alerted_date"] = gen_date
 
     if not pct_map:
         print("两品种分位均计算失败，本次不推送（保留旧状态，下次重试）")
@@ -230,10 +232,11 @@ def run_core():
         else:
             print(f"{prod}: 持仓中/换月窗口，不推送")
 
-    # 数据滞后告警（每日最多一次）
+    # 数据滞后告警（每日最多一次）：推送失败则不写去重键 → 下次重试
     if stale_msgs and state.get("stale_alerted_date") != gen_date:
-        push_wechat("⚠️ IM/IC 数据滞后告警", "\n".join(stale_msgs))
-        state["stale_alerted_date"] = gen_date
+        ok = push_wechat("⚠️ IM/IC 数据滞后告警", "\n".join(stale_msgs))
+        if ok:
+            state["stale_alerted_date"] = gen_date
 
     if parts:
         desp = f"生成日期：{gen_date}\n\n" + "\n\n".join(parts)
