@@ -1,0 +1,54 @@
+name: Deploy IM-IC Strategy Page
+
+on:
+  schedule:
+    - cron: '0 10 * * *'        # 每天 10:00 UTC = 18:00 北京时间
+  workflow_dispatch:           # 允许在 Actions 页面手动触发
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build page (fetch data + generate HTML)
+        env:
+          FORCE_FETCH: '1'
+          TZ: 'Asia/Shanghai'
+        run: python build_reco_strategy_page.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
