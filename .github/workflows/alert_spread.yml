@@ -1,0 +1,45 @@
+name: IM-IC Spread WeChat Alert
+
+on:
+  schedule:
+    - cron: '0 15 * * *'        # 每天 15:00 UTC = 23:00 北京时间（确保含当天期货收盘数据）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore spread alert state
+        uses: actions/cache@v4
+        with:
+          path: spread_state.json
+          key: spread-state-${{ github.run_id }}
+          restore-keys: |
+            spread-state-
+
+      - name: Run IM/IC alert (push to WeChat)
+        env:
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          TZ: 'Asia/Shanghai'
+        run: python alert_spread.py
+
+      - name: Save spread alert state
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: spread_state.json
+          key: spread-state-${{ github.run_id }}
