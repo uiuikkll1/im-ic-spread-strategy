@@ -1,4 +1,16 @@
 __pycache__/
 *.pyc
-*.parquet
 public/
+*.html
+logs.zip
+
+# 默认忽略 parquet，但策略运行所需的基础数据文件保留
+*.parquet
+!im_future_data.parquet
+!ic_future_data.parquet
+!im_main_cont.parquet
+!ic_main_cont.parquet
+!im_spread_panel_all_i1_i3.parquet
+!ic_spread_panel_all_i1_i3.parquet
+!中证1000_idx.parquet
+!中证500_idx.parquet

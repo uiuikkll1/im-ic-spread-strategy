@@ -67,8 +67,21 @@ def run_hold(panel, px, last_day, side="S_far", roll_buf=5, init_cap=250000.0,
     trades, equity = [], []
     nav = init_cap
     pos = None
+    pending_open = None  # T日收盘信号 -> T+1开盘执行，避免未来函数
 
     for i, d in enumerate(dates):
+        # 1) 执行昨日收盘生成的 pending 开仓（T+1 开盘成交）
+        if pending_open is not None and pos is None:
+            a = px.get((d, nc[i])); b = px.get((d, fc[i]))
+            if a is not None and b is not None and not pd.isna(a[fi_entry]) and not pd.isna(b[fi_entry]):
+                ld = last_day.get(nc[i])
+                dte = _trading_days_between(d, ld)
+                if dte > roll_buf:
+                    pos = {"side": side, "nc": nc[i], "fc": fc[i],
+                           "npx": a[fi_entry], "fpx": b[fi_entry], "d": d, "lots": lots}
+            pending_open = None
+
+        # 2) 平仓
         if pos is not None:
             ld = last_day.get(pos["nc"])
             dte = _trading_days_between(d, ld)
@@ -102,19 +115,15 @@ def run_hold(panel, px, last_day, side="S_far", roll_buf=5, init_cap=250000.0,
                     })
                     pos = None
 
+        # 3) T日收盘后生成开仓信号，留给明日开盘执行
         if pos is None and i < len(dates) - 1:
             ok_timing = True
             if enter_high is not None:
                 ok_timing = (pct is not None and not np.isnan(pct[i]) and pct[i] >= enter_high)
             if basis_ok is not None and not basis_ok[i]:
                 ok_timing = False
-            ld = last_day.get(nc[i])
-            dte = _trading_days_between(d, ld)
-            if ok_timing and dte > roll_buf:
-                a = px.get((d, nc[i])); b = px.get((d, fc[i]))
-                if a is not None and b is not None and not pd.isna(a[fi_entry]) and not pd.isna(b[fi_entry]):
-                    pos = {"side": side, "nc": nc[i], "fc": fc[i],
-                           "npx": a[fi_entry], "fpx": b[fi_entry], "d": d, "lots": lots}
+            if ok_timing:
+                pending_open = i
 
         floating = 0.0
         if pos is not None:
