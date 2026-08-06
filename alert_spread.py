@@ -2,10 +2,10 @@
 IM/IC 跨期展期策略 —— 每日收盘后推送「明日操作」到微信（Server酱）
 逻辑（与实操页一致，近月-隔季 i0_i3）：
   - 持仓中 & 当月距到期≤10交易日 → 明日平仓（换月）
-  - 持仓中 & 未到换月            → 明日无需操作
+  - 持仓中 & 未到换月            → 不推送（持仓中不用推）
   - 空仓 & 分位达标              → 明日开仓：多近月+空隔季
   - 空仓 & 分位不达标            → 明日不用开仓
-每天固定推一条合并消息（IM+IC），用 spread_state.json 记录两品种持仓状态。
+有消息才推，没消息（两边都持仓中）就不打扰。
 """
 import os
 import json
@@ -81,8 +81,8 @@ def analyze(prod, state):
             msg = f"【{prod} 明日】平仓（换月）：平多 {near} + 平空 {far}（当月距到期 {cnt} 交易日）"
             new_h = 0
         else:
-            msg = f"【{prod} 明日】持仓中，无需操作（分位 {cur_pct:.2f}，未到换月）"
-            new_h = 1
+            # 持仓中且未到换月：不推送，保持持仓状态
+            return None, 1, cur_pct, near, far, cnt
     else:
         if cur_pct >= enter_high:
             msg = f"【{prod} 明日】开仓：多 {near} + 空 {far}（分位 {cur_pct:.2f} ≥ {enter_high}，次日开盘执行）"
@@ -112,10 +112,17 @@ def main():
     for prod in ["IM", "IC"]:
         msg, new_h, pct, near, far, cnt = analyze(prod, state)
         state[prod] = new_h
-        parts.append(msg)
-        print(f"{prod}: {msg}")
+        if msg:
+            parts.append(msg)
+            print(f"{prod}: {msg}")
+        else:
+            print(f"{prod}: 持仓中，不推送")
 
     save_state(state)
+
+    if not parts:
+        print("今日 IM/IC 均无操作，跳过推送")
+        return
 
     today = dt.date.today()
     desp = f"日期：{today:%Y-%m-%d}\n\n" + "\n\n".join(parts)
