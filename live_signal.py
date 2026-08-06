@@ -4,17 +4,33 @@ import pandas as pd, numpy as np, requests, re, datetime as dt
 import backtest_im_spread as v1
 from spread_hold_lib import contract_last_trade_day
 
+def third_friday(y, m):
+    """返回 y 年 m 月第三个周五（股指期货/期权常规交割日）。"""
+    d = dt.date(y, m, 1)
+    offset = (4 - d.weekday()) % 7          # 距当月第一个周五
+    d = d + dt.timedelta(days=offset) + dt.timedelta(days=14)
+    return d
+
+
 # 当前组合：近月-隔季 = 当月(c1) + 隔季(c4)
-# 动态推导当月/隔季合约，避免硬编码到期后失效
+# 动态推导当月/隔季合约，避免硬编码到期后失效。
+# 关键修正：若今天已过「当月第三个周五」（当月合约已交割），
+# 当前近月应滚到次月，否则会取到已摘牌合约。
 def current_c1_c4(prod, today=None):
     today = today or dt.date.today()
-    y, m = today.year, today.month
-    c1 = (y % 100) * 100 + m
-    # 隔季 = 下月(M+1)之后的第2个季月(3/6/9/12)；从 M+2 起扫描，避免把下月自身当季月
+    # 近月 c1：交割后取次月为当前近月
+    if today > third_friday(today.year, today.month):
+        m1 = today.month + 1; y1 = today.year
+        if m1 > 12:
+            m1 = 1; y1 += 1
+    else:
+        m1 = today.month; y1 = today.year
+    c1 = (y1 % 100) * 100 + m1
+    # 隔季 = 从 m1+1 起扫描，取第 2 个季月(3/6/9/12)
     qs = []
-    mm = m + 2; yy = y
+    mm = m1 + 1; yy = y1
     if mm > 12:
-        mm -= 12; yy += 1
+        mm = 1; yy += 1
     for _ in range(36):
         if mm in (3, 6, 9, 12):
             qs.append((yy, mm))
