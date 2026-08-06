@@ -1,0 +1,23 @@
+name: Keepalive (防定时任务被停用)
+
+# GitHub 会在仓库连续 60 天无 commit 时自动停用所有 scheduled workflow。
+# 本 workflow 每半个月自动空 commit 一次，确保信号推送定时任务永不失效。
+on:
+  schedule:
+    - cron: '0 4 1,15 * *'      # 每月 1 号、15 号 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty commit to keep workflows alive
+        run: |
+          git config user.email "keepalive@workbuddy.local"
+          git config user.name "keepalive"
+          git commit --allow-empty -m "chore: keepalive (防止 scheduled workflow 被 GitHub 停用)" || echo "nothing to commit"
+          git push
