@@ -36,7 +36,7 @@ STALE_TD = 5     # 面板末行距运行日超过 5 个交易日即视为数据�
 # 真实交易日历 + 换月缓冲统一从 trade_calendar 取，与实操页 / 回测共用同一套，
 # 根除「周一到周五」(weekday<5) 口径分裂（H2 统一）。
 from trade_calendar import (ROLL_BUF, is_trade_day, trading_days_between,
-                            load_trade_calendar)
+                            load_trade_calendar, calendar_ok)
 
 
 class StateCorrupt(Exception):
@@ -174,6 +174,15 @@ def run_core():
     run_day = dt.date.today()           # TZ 已在 workflow 设为 Asia/Shanghai
     gen_date = run_day.isoformat()
 
+    # M2：真实日历降级告警（日历拉取失败 → is_trade_day 回退 weekday 近似，换月判断可能不准）
+    if not calendar_ok():
+        if state.get("cal_alerted_date") != gen_date:
+            ok = push_wechat("⚠️ 交易日历降级告警",
+                             "真实交易日历拉取失败，换月/持仓倒计时已回退为周一到周五近似（不剔除法定假日），"
+                             "换月窗口判断可能失真，请检查 akshare 行情源")
+            if ok:
+                state["cal_alerted_date"] = gen_date
+
     # 逐品种算分位；失败的记下来单独告警，不拖累另一个品种
     pct_map = {}
     failed = []
@@ -202,6 +211,7 @@ def run_core():
     parts = []
     results = {}
     evaluated = {}          # 本批实际评估过的品种 -> 数据日（推送成功才标记键）
+    held_map = {}           # 本批持仓合约记录：prod -> (near, far) 或 (None, None) 表示清仓
     stale_msgs = []
     for prod in ["IM", "IC"]:
         if prod not in pct_map:
@@ -211,6 +221,7 @@ def run_core():
         # 杜绝 current_c1_c4 推导与面板不一致导致的错单（如把隔季算成下季）。
         near, far = pnear, pfar
         W, enter_high, _idx = PARAMS[prod]
+        holding = int(state.get(prod, 0))
 
         # 换月窗口用「数据日(面板末行)」而非「运行日」，消除双 cron 跨午夜的口径漂移
         # H2：用真实交易日历数距到期的交易日，剔除国庆/春节等法定假日，避免误报换月
@@ -235,33 +246,42 @@ def run_core():
             continue
 
         evaluated[prod] = qdate
-        holding = int(state.get(prod, 0))
         new_h = holding
         msg = None
 
+        # C5：持仓合约与状态记录不一致 = 期间换月/到期且平仓推送可能失败，
+        #     强制清仓并告警，避免状态机永久错位（用户需人工核对实际持仓）。
+        held_near = state.get(f"{prod}_near")
+        held_far = state.get(f"{prod}_far")
+        mismatch = bool(holding and held_near is not None and (held_near != near or held_far != far))
+
         if holding:
-            if in_roll:
+            if mismatch:
+                msg = (f"【{prod} 状态重置】持仓合约已变化：原持有 {held_near}/{held_far}，"
+                       f"当前面板合约 {near}/{far}。疑似换月/到期且平仓推送未成功，"
+                       f"已将状态重置为清仓，请人工核对实际持仓并按新信号操作。")
+                new_h = 0
+                held_map[prod] = (None, None)
+            elif in_roll:
                 msg = (f"【{prod} 明日】平仓（换月）：平多 {near} + 平空 {far}\n\n"
                        f"当月距到期 {cnt} 交易日（最后交易日 {ltd}）")
                 new_h = 0
+                held_map[prod] = (None, None)
             # else 持仓中且未到换月：不推
         else:
             if not in_roll and cur_pct >= enter_high:
                 msg = (f"【{prod} 明日】开仓：多 {near} + 空 {far}\n\n"
                        f"分位 {cur_pct:.2f} ≥ {enter_high}，当日价差率 {(nlast - flast) / nlast:.3f}（报价日 {qdate}），次日开盘执行")
                 new_h = 1
-            elif not in_roll:
-                msg = (f"【{prod} 明日】不用开仓\n\n"
-                       f"分位 {cur_pct:.2f} < {enter_high}（报价日 {qdate}），等待更深贴水")
-                new_h = 0
-            # else 空仓且处于换月窗口：不推（避免开快到期/已摘牌合约）
+                held_map[prod] = (near, far)
+            # else 空仓且(分位未达标 或 处于换月窗口)：不推（无状态变化，避免每天骚扰「不用开仓」）
 
         results[prod] = new_h
         if msg:
             parts.append(msg)
             print(f"{prod}: {msg}")
         else:
-            print(f"{prod}: 持仓中/换月窗口，不推送")
+            print(f"{prod}: 持仓中/换月窗口/等待中，不推送")
 
     # 数据滞后告警（每日最多一次）：推送失败则不写去重键 → 下次重试
     if stale_msgs and state.get("stale_alerted_date") != gen_date:
@@ -277,6 +297,14 @@ def run_core():
             state.update(results)
             for p, q in evaluated.items():
                 state[f"{p}_key"] = q
+            # C5：记录/清除持仓合约，供下次检测换月错位
+            for p, (n, f) in held_map.items():
+                if n is None:
+                    state.pop(f"{p}_near", None)
+                    state.pop(f"{p}_far", None)
+                else:
+                    state[f"{p}_near"] = n
+                    state[f"{p}_far"] = f
         else:
             # 推送失败：保留旧状态，不标记已处理，下次重试
             print(f"数据日 {gen_date} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
@@ -307,8 +335,7 @@ def main():
             except Exception:
                 pass
             st["alerted_date"] = today
-            json.dump(st, open(STATE_FILE, "w", encoding="utf-8"),
-                      ensure_ascii=False, indent=2)
+            save_state(st)   # M6：原子写，且不改持仓状态（异常后下次继续重试）
         # 不标记 processed_key → 下次运行继续重试
 
 

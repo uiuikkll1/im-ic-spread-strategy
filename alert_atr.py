@@ -38,7 +38,7 @@ STATE_FILE = "atr_state.json"
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "")
 STALE_TD = 5     # 最新行情距今日超过 5 个交易日即视为数据滞后，发告警
 # ATR 侧数据滞后判断也用统一真实交易日历（与 IM/IC 推送一致）
-from trade_calendar import trading_days_between
+from trade_calendar import trading_days_between, calendar_ok
 
 
 class StateCorrupt(Exception):
@@ -208,13 +208,18 @@ def run_core():
 
     d_str = f"{d:%Y-%m-%d}"
 
-    # 2) 防漏推：该数据日(最后交易日的K线)已处理过（重复跑/双 cron/重试/周末）则跳过。
-    #    用数据日而非运行日：双 cron 19:00/20:00 与周末看到的是同一根K线，第二次应跳过。
-    if st.get("processed_key") == d_str:
-        print(f"{d_str} 已处理过（防重复推送），跳过")
-        return
+    # M2：真实日历降级告警（日历拉取失败 → 滞后计数回退 weekday 近似）
+    if not calendar_ok():
+        today = dt.date.today().isoformat()
+        if st.get("cal_alerted_date") != today:
+            if push_wechat("⚠️ 交易日历降级告警",
+                           "真实交易日历拉取失败，数据滞后计数已回退为周一到周五近似，请检查 akshare 行情源"):
+                st["cal_alerted_date"] = today
+                save_state(st)
 
-    # 3) H3 数据滞后告警（独立于信号推送，避免数据源一挂就无声死掉）
+    # 2) H3 数据滞后告警（必须在幂等守卫之前！即便今天已处理过该数据日，
+    #    只要行情冻结(d 不前进)也应每日告警，否则数据源一挂就静默死掉、
+    #    且因下面守卫早 return 永远走不到这里）
     tdiff = trading_days_between(d_str, dt.date.today().isoformat())
     if tdiff > STALE_TD:
         today = dt.date.today().isoformat()
@@ -224,6 +229,12 @@ def run_core():
                            f"信号可能基于旧数据，请检查数据源"):
                 st["stale_alerted_date"] = today
                 save_state(st)
+
+    # 3) 防漏推：该数据日(最后交易日的K线)已处理过（重复跑/双 cron/重试/周末）则跳过。
+    #    用数据日而非运行日：双 cron 19:00/20:00 与周末看到的是同一根K线，第二次应跳过。
+    if st.get("processed_key") == d_str:
+        print(f"{d_str} 已处理过（防重复推送），跳过")
+        return
 
     # 4) 信号推送（仅在状态切换时推一次）
     holding = int(st.get("holding", 0))

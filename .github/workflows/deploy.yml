@@ -31,9 +31,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build page (fetch data + generate HTML)
+      - name: Refresh data (rebuild parquet + spread panels from akshare)
         env:
-          FORCE_FETCH: '1'
+          TZ: 'Asia/Shanghai'
+        run: python fetch_full_data.py
+
+      - name: Build page (generate HTML from fresh data)
+        env:
           TZ: 'Asia/Shanghai'
         run: python build_reco_strategy_page.py
 

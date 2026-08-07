@@ -2,8 +2,9 @@ name: IM-IC Spread WeChat Alert
 
 on:
   schedule:
-    # 双 cron 兜底：23:00 + 00:00 北京时间各跑一次，单次被跳过另一次能补上
-    - cron: '0 15,16 * * *'      # 15:00/16:00 UTC = 23:00/00:00 北京时间
+    # 双 cron 兜底：00:00 + 01:00 北京时间各跑一次，单次被跳过另一次能补上
+    # 延后到 deploy(23:00 北京时间重建数据) 之后，避免两 workflow 同时狂拉新浪被限流
+    - cron: '0 16,17 * * *'      # 16:00/17:00 UTC = 00:00/01:00 北京时间
   workflow_dispatch:
 
 concurrency:
@@ -39,12 +40,20 @@ jobs:
 
       # H6：状态直接提交回仓库（不再用 actions/cache，避免缓存被淘汰导致状态回落）。
       # [skip ci] 防止该提交触发 Deploy 工作流无限重建页面。
+      # C4 修复：refresh_panels 会改动被 git 跟踪的 parquet；若只 add 状态文件，
+      # 这些未提交的 parquet 改动会让 git pull --rebase 直接 abort 并被 || true 吞掉，
+      # 导致状态写不回、打穿幂等。提交前先还原 parquet（每次运行会重建、不持久化）。
       - name: Commit state back (durable)
         if: always()
         run: |
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
+          git checkout -- '*.parquet' || true
           git add spread_state.json
           git diff --cached --quiet || git commit -m "chore: persist IM/IC alert state [skip ci]"
-          git pull --rebase origin main || true
-          git push
+          for i in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "状态已写回仓库"; break
+            fi
+            echo "第 $i 次推送失败，重试..."; sleep 8
+          done

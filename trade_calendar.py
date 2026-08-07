@@ -28,20 +28,41 @@ def load_trade_calendar(force=False):
     global _TRADE_CAL, _CAL_MIN, _CAL_MAX
     if _TRADE_CAL is not None and not force:
         return _TRADE_CAL
-    try:
-        df = ak.tool_trade_date_hist_sina()
-        col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-        vals = df[col].astype(str).str.replace("-", "").str.strip()
-        _TRADE_CAL = set(vals)
-        _CAL_MIN = min(_TRADE_CAL)
-        _CAL_MAX = max(_TRADE_CAL)
-        print(f"真实交易日历加载完成，共 {len(_TRADE_CAL)} 天（{_CAL_MIN}~{_CAL_MAX}）")
-    except Exception as e:
-        print(f"真实交易日历拉取失败（回退 weekday 简单判断）: {e}")
-        _TRADE_CAL = set()   # 空集合 → is_trade_day 回退 weekday
-        _CAL_MIN = None
-        _CAL_MAX = None
+    last_err = None
+    for attempt in range(3):   # 网络抖动重试，避免单次失败就静默降级
+        try:
+            df = ak.tool_trade_date_hist_sina()
+            col = "trade_date" if "trade_date" in df.columns else df.columns[0]
+            vals = df[col].astype(str).str.replace("-", "").str.strip()
+            if not vals.empty:
+                _TRADE_CAL = set(vals)
+                _CAL_MIN = min(_TRADE_CAL)
+                _CAL_MAX = max(_TRADE_CAL)
+                print(f"真实交易日历加载完成，共 {len(_TRADE_CAL)} 天（{_CAL_MIN}~{_CAL_MAX}）")
+                return _TRADE_CAL
+            last_err = "akshare 返回空日历"
+        except Exception as e:
+            last_err = e
+        if attempt < 2:
+            import time
+            time.sleep(2 * (attempt + 1))
+    print(f"真实交易日历拉取失败（回退 weekday 简单判断）: {last_err}")
+    _TRADE_CAL = set()   # 空集合 → is_trade_day 回退 weekday
+    _CAL_MIN = None
+    _CAL_MAX = None
     return _TRADE_CAL
+
+
+def calendar_ok():
+    """日历是否成功加载（用于降级告警：未加载时 is_trade_day 会回退 weekday 近似）。"""
+    return bool(load_trade_calendar())
+
+
+def cal_meta():
+    """返回日历覆盖范围（字符串 'YYYYMMDD'），供实操页 JS 判断越界回退。
+    未加载时返回 (None, None)。"""
+    load_trade_calendar()
+    return _CAL_MIN, _CAL_MAX
 
 
 def is_trade_day(d):

@@ -31,19 +31,35 @@ def _enum_contracts(prefix):
     return out
 
 
+def _third_friday(y, m):
+    """y 年 m 月第三个周五（股指期货常规交割日）。"""
+    d = dt.date(y, m, 1)
+    offset = (4 - d.weekday()) % 7          # 距当月第一个周五
+    d = d + dt.timedelta(days=offset) + dt.timedelta(days=14)
+    return d
+
+
 def _active_contracts(prefix, today):
-    """按中金所规则返回当月、次月、随后两个季月合约。"""
+    """按中金所规则返回挂牌合约：当月、次月、随后三个季月（共5个）。
+    - 交割后（过当月第三个周五）当前近月滚到次月，避免列出已摘牌合约。
+    - 列足远季月，确保远月腿(隔季 c4)在增量刷新时也能拉到最新价，避免图表/面板停更。
+    与 live_signal.current_c1_c4 的合约推导思路对齐。"""
     y, m = today.year, today.month
-    codes = [_code(prefix, y, m)]
+    if today > _third_friday(y, m):          # 已过当月交割日 → 当前近月滚到次月
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    codes = [f"{prefix}{y % 100:02d}{m:02d}"]
     nm, ny = m + 1, y
     if nm > 12:
         nm, ny = 1, y + 1
-    codes.append(_code(prefix, ny, nm))
-    q = (m - 1) // 3
-    for k in range(1, 3):
-        q2 = (q + k) % 4
-        yy = y + (q + k) // 4
-        codes.append(_code(prefix, yy, (q2 + 1) * 3))
+    codes.append(f"{prefix}{ny % 100:02d}{nm:02d}")
+    # 季月 = 3/6/9/12，从当前月所在季之后依次取 3 个
+    cur_q = (m - 1) // 3
+    for k in range(1, 4):
+        q2 = (cur_q + k) % 4
+        yy = y + (cur_q + k) // 4
+        codes.append(f"{prefix}{yy % 100:02d}{(q2 + 1) * 3:02d}")
     return sorted(set(codes))
 
 

@@ -6,7 +6,7 @@ import backtest_im_spread as v1
 from spread_hold_lib import build_px, run_hold, MULT, contract_last_trade_day, _trading_days_between
 import live_signal as ls
 # 统一真实交易日历 + 换月缓冲（与微信推送一致，根除「网页3/微信10」的口径分裂）
-from trade_calendar import ROLL_BUF, is_trade_day, cal_json
+from trade_calendar import ROLL_BUF, is_trade_day, cal_json, cal_meta
 
 INIT = 500000.0
 
@@ -22,8 +22,15 @@ def extend_data_to_today(raw, pf, mc, prod):
     today = pd.Timestamp(dt.date.today())
     if last_raw >= today:
         return raw, pf, mc
-    near_c = pf['near_code'].iloc[-1]
-    far_c = pf['far_code'].iloc[-1]
+    # 用真实合约推导（与推送同源），而非面板末行固定合约：
+    # 换月后面板末行仍是旧合约(已摘牌)，用它能拿到 0 行 → 图表停在旧日期。
+    try:
+        near_c, far_c = ls.current_c1_c4(prod)
+        print(f'[{prod}] 联网补数目标合约(当前推导): {near_c}/{far_c}')
+    except Exception as e:
+        print(f'[{prod}] current_c1_c4 推导失败，回退面板末行合约:', e)
+        near_c = pf['near_code'].iloc[-1]
+        far_c = pf['far_code'].iloc[-1]
     extra_raw = []
     for code in [near_c, far_c]:
         try:
@@ -302,8 +309,10 @@ if sig_ok:
                 x['action'] = f'【空仓中 · 等待】当前分位 {x["pct"]:.3f} < 阈值 {x["enter_high"]}，继续空仓等待深贴水结构。'
                 x['actionable'] = False
 
+_cal_min, _cal_max = cal_meta()
 DATA = {'im':im,'ic':ic,'signal':sig,'signal_ok':sig_ok,
-         'trade_cal': cal_json(), 'roll_buf': ROLL_BUF}
+         'trade_cal': cal_json(), 'roll_buf': ROLL_BUF,
+         'cal_min': _cal_min, 'cal_max': _cal_max}
 if not sig_ok:
     DATA['signal_err'] = sig_err
 DATA_JSON = json.dumps(DATA, ensure_ascii=False)
@@ -484,15 +493,22 @@ function rollingPct(series, window){
 }
 var TRADE_CAL = new Set(DATA.trade_cal);   // 真实交易日历（与 Python 推送同源，build 时注入）
 var ROLL_BUF = DATA.roll_buf;               // 换月缓冲（与微信推送一致）
+var CAL_MIN = DATA.cal_min || null;         // 日历覆盖起点（'YYYYMMDD'）
+var CAL_MAX = DATA.cal_max || null;         // 日历覆盖终点（akshare 一般到当年 12-31）
 function ymd(d){ var y=d.getFullYear(); var m=('0'+(d.getMonth()+1)).slice(-2); var dd=('0'+d.getDate()).slice(-2); return ''+y+m+dd; }
+function parseYmd(dStr){ var y=+dStr.slice(0,4), m=+dStr.slice(4,6)-1, d=+dStr.slice(6,8); return new Date(y, m, d); }
 function isTradeDay(dStr){
-  if(TRADE_CAL.has(dStr)) return true;       // 日历覆盖范围内：真实交易日
-  var dt0=new Date(dStr); var wd=dt0.getDay();
-  return wd!==0 && wd!==6;                    // 越界（日历未覆盖年份）：回退周一到周五
+  // 在日历覆盖年份内：用真实交易日历（剔除法定假日），与 Python 推送完全一致
+  if(CAL_MIN && dStr >= CAL_MIN && dStr <= CAL_MAX){
+    return TRADE_CAL.has(dStr);
+  }
+  // 越界（如次年到期的合约，akshare 日历未覆盖）：无真实数据，回退周一到周五近似
+  var wd = parseYmd(dStr).getDay();
+  return wd!==0 && wd!==6;
 }
 function tradingDaysUntil(ltdStr){
   var today = new Date(); today.setHours(0,0,0,0);
-  var ltd = new Date(ltdStr); ltd.setHours(0,0,0,0);
+  var ltd = parseYmd(ltdStr); ltd.setHours(0,0,0,0);
   var cnt = 0;
   var d = new Date(today);
   while(d <= ltd){
@@ -500,6 +516,17 @@ function tradingDaysUntil(ltdStr){
     d.setDate(d.getDate()+1);
   }
   return cnt;
+}
+function contractLtd(code){
+  // 股指期货合约最后交易日 = 合约年月的第三个周五（与 Python third_friday 一致）
+  var y = 2000 + (+code.slice(2,4));
+  var m = +code.slice(4,6);
+  var first = new Date(y, m-1, 1);
+  var jsWd = first.getDay();                 // 0=Sun..6=Sat
+  var pyWd = (jsWd + 6) % 7;                 // 转成 Python 周一=0
+  var offset = ((4 - pyWd) % 7 + 7) % 7;     // JS 取模修正：保证非负（否则负周偏移一整周）
+  var thirdFri = 1 + offset + 14;
+  return '' + y + ('0'+m).slice(-2) + ('0'+thirdFri).slice(-2);
 }
 var refreshStatus = '初始化';
 function updateRefreshStatus(msg){
@@ -556,7 +583,9 @@ function refreshSignal(){
       s.near_basis = s.near_px - s.idx_px;
       s.far_basis = s.far_px - s.idx_px;
       s.basis_ok = s.near_basis < 0;
-      s.roll_days = tradingDaysUntil(s.ltd);
+      var ltdForCount = pos.is_holding ? contractLtd(pos.near_c) : s.ltd;
+      if(pos.is_holding) s.ltd = ltdForCount;   // 持仓时倒计时用真实持仓合约到期日，与 Python 推送一致
+      s.roll_days = tradingDaysUntil(ltdForCount);
       s.in_roll_window = s.roll_days <= ROLL_BUF;
       s.quote_date = now.toISOString().slice(0,10);
       s.quote_time = now.toTimeString().slice(0,8);
@@ -566,20 +595,14 @@ function refreshSignal(){
       var curSpread = hNearPx - hFarPx;
       var floatPnl = (curSpread - entrySpread) * 200;
       if(s.in_roll_window){
-        s.action = '【换月】下月'+s.near+'距到期≤10交易日，平掉当前持仓 '+pos.near_c+'/'+pos.far_c+'，次日开盘换月至 '+s.near+'/'+s.far;
+        s.action = '【换月】下月'+s.near+'距到期≤'+ROLL_BUF+'交易日，平掉当前持仓 '+pos.near_c+'/'+pos.far_c+'，次日开盘换月至 '+s.near+'/'+s.far;
         s.actionable = true;
-      } else if(s.enter_high == null){
-        s.action = '【持仓中】当前持有 <b>'+pos.near_c+'/'+pos.far_c+'</b>，开仓日 '+pos.entry_d+'，浮动盈亏约 '+Math.round(floatPnl).toLocaleString()+' 元；纯持有策略始终在场，继续持有。';
-        s.actionable = false;
       } else if(pos.is_holding){
-        s.action = '【持仓中】当前持有 <b>'+pos.near_c+'/'+pos.far_c+'</b>，开仓日 '+pos.entry_d+'，浮动盈亏约 '+Math.round(floatPnl).toLocaleString()+' 元；继续持有。';
+        s.action = '【持仓中】当前持有 <b>'+pos.near_c+'/'+pos.far_c+'</b>，开仓日 '+pos.entry_d+'，浮动盈亏约 '+Math.round(floatPnl).toLocaleString()+' 元；继续持有（贴水变浅不主动平仓）。';
         s.actionable = false;
-      } else if(s.pct >= s.enter_high && s.basis_ok){
-        s.action = '【开仓】分位 '+s.pct+' ≥ '+s.enter_high+'，且下月'+s.near+'贴水 '+s.near_basis.toFixed(1)+' 点，次日开盘开多'+s.near+'+开空'+s.far;
+      } else if(s.pct >= s.enter_high){
+        s.action = '【开仓】分位 '+s.pct+' ≥ '+s.enter_high+'，次日开盘开多 '+s.near+' + 开空 '+s.far+'（基差 '+s.near_basis.toFixed(1)+' 点仅供参考）';
         s.actionable = true;
-      } else if(s.pct >= s.enter_high && !s.basis_ok){
-        s.action = '【等待】分位 '+s.pct+' ≥ '+s.enter_high+'，但下月'+s.near+'升水 '+s.near_basis.toFixed(1)+' 点，属于危险结构，不开仓';
-        s.actionable = false;
       } else {
         s.action = '【等待】分位 '+s.pct+' < '+s.enter_high+'，需贴水更深（价差率更大）才开仓';
         s.actionable = false;
