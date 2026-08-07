@@ -36,21 +36,53 @@ BODY_THR = 0.0               # 实体阈值（占开盘价比例），0 = 不限
 STATE_FILE = "atr_state.json"
 
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "")
+STALE_TD = 5     # 最新行情距今日超过 5 个交易日即视为数据滞后，发告警
+# ATR 侧数据滞后判断也用统一真实交易日历（与 IM/IC 推送一致）
+from trade_calendar import trading_days_between
+
+
+class StateCorrupt(Exception):
+    """状态文件损坏/校验失败：宁可暂停推送，也不在持仓状态未知时误推买卖。"""
 
 
 def load_state():
     try:
-        s = json.load(open(STATE_FILE, "r", encoding="utf-8"))
-        return int(s.get("holding", 0)), str(s.get("processed_key", ""))
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = f.read()
+        st = json.loads(raw)
+        h = st.get("holding", 0)
+        if h not in (0, 1):
+            raise ValueError(f"holding 非法: {h}")
+        pk = st.get("processed_key", "")
+        if not isinstance(pk, str):
+            raise ValueError("processed_key 类型错误")
+        return st
+    except Exception as e:
+        print(f"ATR 状态文件读取/校验失败: {e}")
+        _alert_once(STATE_FILE + ".corrupt", "⚠️ ATR 状态文件异常",
+                    f"atr_state.json 读取/校验失败（{e}），今日暂停推送，请检查文件",
+                    dt.date.today().isoformat())
+        raise StateCorrupt()
+
+
+def save_state(st):
+    # H4：原子写（先写临时文件再 os.replace），避免半截文件导致下次加载损坏
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+def _alert_once(marker, title, desp, today):
+    """每日最多推送一次某类告警：用 marker 标记文件记录上次推送日期。"""
+    try:
+        if os.path.exists(marker) and open(marker, "r", encoding="utf-8").read().strip() == today:
+            return
+        if push_wechat(title, desp):
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(today)
     except Exception:
-        return 0, ""   # 0=空仓, 1=持仓；processed_key=已处理的数据日(最后交易日的K线)
-
-
-def save_state(holding, processed_key):
-    json.dump({"holding": holding, "processed_key": processed_key,
-               "updated": str(dt.date.today())},
-              open(STATE_FILE, "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
+        pass
 
 
 def fetch_index():
@@ -156,17 +188,45 @@ def push_wechat(title, desp):
 
 
 def run_core():
-    holding, processed = load_state()
+    try:
+        st = load_state()
+    except StateCorrupt:
+        return   # 状态损坏已在 load_state 内告警，今日放弃推送
 
-    d, c, o, up, m, b, buy_trig, sell_trig = compute_signal()
+    # 1) 取信号（失败=数据缺失）
+    try:
+        d, c, o, up, m, b, buy_trig, sell_trig = compute_signal()
+    except Exception as e:
+        err = f"ATR 数据源缺失/异常：{e}"
+        print(err)
+        today = dt.date.today().isoformat()
+        if st.get("data_alerted_date") != today:
+            if push_wechat("⚠️ ATR 数据缺失告警", err):
+                st["data_alerted_date"] = today
+                save_state(st)
+        return
+
     d_str = f"{d:%Y-%m-%d}"
 
-    # 防漏推 1：该数据日(最后交易日的K线)已处理过（重复跑/双 cron/重试/周末）则跳过。
-    # 用数据日而非运行日：双 cron 19:00/20:00 与周末看到的是同一根K线，第二次应跳过。
-    if processed == d_str:
+    # 2) 防漏推：该数据日(最后交易日的K线)已处理过（重复跑/双 cron/重试/周末）则跳过。
+    #    用数据日而非运行日：双 cron 19:00/20:00 与周末看到的是同一根K线，第二次应跳过。
+    if st.get("processed_key") == d_str:
         print(f"{d_str} 已处理过（防重复推送），跳过")
         return
 
+    # 3) H3 数据滞后告警（独立于信号推送，避免数据源一挂就无声死掉）
+    tdiff = trading_days_between(d_str, dt.date.today().isoformat())
+    if tdiff > STALE_TD:
+        today = dt.date.today().isoformat()
+        if st.get("stale_alerted_date") != today:
+            if push_wechat("⚠️ ATR 数据滞后告警",
+                           f"ATR 最新行情为 {d_str}，距今日已 {tdiff} 个交易日（阈值 {STALE_TD}），"
+                           f"信号可能基于旧数据，请检查数据源"):
+                st["stale_alerted_date"] = today
+                save_state(st)
+
+    # 4) 信号推送（仅在状态切换时推一次）
+    holding = int(st.get("holding", 0))
     msg = None
     new_state = holding
 
@@ -188,21 +248,25 @@ def run_core():
     if msg:
         ok = push_wechat("ATR突破策略信号", msg)
         if ok:
-            # C2：只有推送成功才写新状态 + 标记已处理（数据日）
-            save_state(new_state, d_str)
+            # 只有推送成功才写新状态 + 标记已处理（数据日）
+            st["holding"] = new_state
+            st["processed_key"] = d_str
+            save_state(st)
         else:
             # 推送失败：保留旧状态（holding 不变），不标记已处理，下次重试
-            save_state(holding, processed)
             print(f"{d_str} 推送失败，保留旧状态，不标记已处理，下次继续尝试")
     else:
         # 无信号日：不翻转状态，仅标记该日已处理（避免重复跑空/周末噪音）
-        save_state(holding, d_str)
+        st["processed_key"] = d_str
+        save_state(st)
         print(f"{d_str} 无信号（holding={holding}）")
 
 
 def main():
     try:
         run_core()
+    except StateCorrupt:
+        return   # 状态损坏已告警，不再重复推异常
     except Exception as e:
         err = f"ATR 信号系统异常：{e}"
         print(err)
@@ -219,7 +283,7 @@ def main():
             st["alerted_date"] = today
             json.dump(st, open(STATE_FILE, "w", encoding="utf-8"),
                       ensure_ascii=False, indent=2)
-        # 不标记 processed_date → 下次运行继续重试
+        # 不标记 processed_key → 下次运行继续重试
 
 
 if __name__ == "__main__":

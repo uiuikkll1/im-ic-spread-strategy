@@ -20,15 +20,22 @@ def build_px(raw):
 
 
 def _trading_days_between(start, end):
-    """计算 start 到 end 之间（含两端）的交易日数量。"""
+    """计算 start 到 end 之间（含两端）的交易日数量（真实交易日历，剔除法定假日）。
+
+    统一用 trade_calendar.is_trade_day，与微信推送 / 实操页实时信号共用同一套口径，
+    根除「周一到周五」(weekday<5) 口径分裂。日历不可用时回退周一到周五。"""
     if start is None or end is None or start > end:
         return 0
     s = start.date() if hasattr(start, 'date') else start
     e = end.date() if hasattr(end, 'date') else end
+    try:
+        from trade_calendar import is_trade_day
+    except Exception:
+        is_trade_day = lambda d: d.weekday() < 5
     days = 0
     d = s
     while d <= e:
-        if d.weekday() < 5:
+        if is_trade_day(d):
             days += 1
         d += dt.timedelta(days=1)
     return days

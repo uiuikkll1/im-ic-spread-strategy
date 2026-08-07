@@ -19,5 +19,6 @@ jobs:
         run: |
           git config user.email "keepalive@workbuddy.local"
           git config user.name "keepalive"
-          git commit --allow-empty -m "chore: keepalive (防止 scheduled workflow 被 GitHub 停用)" || echo "nothing to commit"
+          git commit --allow-empty -m "chore: keepalive (防止 scheduled workflow 被 GitHub 停用) [skip ci]" || echo "nothing to commit"
+          git pull --rebase origin main || true
           git push

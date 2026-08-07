@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   alert:
@@ -19,6 +19,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,23 +31,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore spread alert state
-        uses: actions/cache/restore@v4
-        with:
-          path: spread_state.json
-          key: spread-state-${{ github.run_id }}
-          restore-keys: |
-            spread-state-
-
       - name: Run IM/IC alert (push to WeChat)
         env:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           TZ: 'Asia/Shanghai'
         run: python alert_spread.py
 
-      - name: Save spread alert state
+      # H6：状态直接提交回仓库（不再用 actions/cache，避免缓存被淘汰导致状态回落）。
+      # [skip ci] 防止该提交触发 Deploy 工作流无限重建页面。
+      - name: Commit state back (durable)
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: spread_state.json
-          key: spread-state-${{ github.run_id }}
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add spread_state.json
+          git diff --cached --quiet || git commit -m "chore: persist IM/IC alert state [skip ci]"
+          git pull --rebase origin main || true
+          git push

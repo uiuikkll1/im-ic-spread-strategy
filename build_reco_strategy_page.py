@@ -5,9 +5,10 @@ import pandas as pd, numpy as np, json, datetime as dt, os
 import backtest_im_spread as v1
 from spread_hold_lib import build_px, run_hold, MULT, contract_last_trade_day, _trading_days_between
 import live_signal as ls
+# 统一真实交易日历 + 换月缓冲（与微信推送一致，根除「网页3/微信10」的口径分裂）
+from trade_calendar import ROLL_BUF, is_trade_day, cal_json
 
 INIT = 500000.0
-RBL = 3  # roll buffer（近月腿距到期<=3交易日换月，与网格最优一致）
 
 def extend_data_to_today(raw, pf, mc, prod):
     """联网用 akshare 把期货日线补到最近交易日，避免图表停留在 parquet 最后日期。"""
@@ -81,7 +82,7 @@ def extend_data_to_today(raw, pf, mc, prod):
     return raw, pf, mc
 
 # ---------------- 跑 IM / IC 推荐组合 ----------------
-def run_pair(prod, key, W, enter_high, require_basis=False, rb=RBL):
+def run_pair(prod, key, W, enter_high, require_basis=False, rb=ROLL_BUF):
     raw = pd.read_parquet(f'{prod.lower()}_future_data.parquet'); raw['date']=pd.to_datetime(raw['date'])
     pf = pd.read_parquet(f'{prod.lower()}_spread_panel_all_{key}.parquet'); pf['date']=pd.to_datetime(pf['date'])
     mc = pd.read_parquet(f'{prod.lower()}_main_cont.parquet'); mc['date']=pd.to_datetime(mc['date'])
@@ -231,20 +232,20 @@ def build_block(prod, st, td, e2, corr, label, rule_text, W, eh, sr_align, pct_a
     }
 
 # IM: 近月-隔季 i0_i3 = 多当月(c1)+空隔季(c4), W252, 深贴水分位>=0.20
-im_st,im_td,im_eq,im_e2,im_corr,_,_,im_sr,im_pct,im_pos = run_pair('IM','i0_i3',252,0.20,require_basis=False,rb=3)
+im_st,im_td,im_eq,im_e2,im_corr,_,_,im_sr,im_pct,im_pos = run_pair('IM','i0_i3',252,0.20,require_basis=False,rb=ROLL_BUF)
 im_rule = """<b>品种</b>：中证1000股指期货（IM）｜<b>组合</b>：<b>近月-隔季 = 多当月(c1) + 空隔季(c4)</b>，1:1 锁合约，各1手<br>
 （说明：c1=当月合约，c4=隔季合约——即再下一个季月；本组合是网格全参数中最优的，年化/卡玛显著优于旧的远月-隔季 i1_i3。）<br>
 <b>入场</b>：spread_rel=(当月收盘−隔季收盘)/当月收盘，取滚动252日分位；当<b>分位≥0.20（深贴水）</b>时，于<b>次日开盘</b>开多当月(c1)+开空隔季(c4)。<br>
-<b>出场/换月</b>：仅当<b>当月腿距到期≤3交易日换月</b>；<b>持仓期间不因贴水变浅主动平仓</b>（吃满展期收益）。<br>
+<b>出场/换月</b>：仅当<b>当月腿距到期≤10交易日换月</b>；<b>持仓期间不因贴水变浅主动平仓</b>（吃满展期收益）。<br>
 <b>本金50万</b>，每对保证金约24万，盯市用收盘价。结构上当月合约常年贴水指数，无需额外基差过滤。"""
 im = build_block('IM',im_st,im_td,im_e2,im_corr,'IM 近月-隔季（深贴水分位≥0.20）',im_rule,252,0.20,im_sr,im_pct,im_pos)
 
 # IC: 近月-隔季 i0_i3 = 多当月(c1)+空隔季(c4), W500, 深贴水分位>=0.40
-ic_st,ic_td,ic_eq,ic_e2,ic_corr,_,_,ic_sr,ic_pct,ic_pos = run_pair('IC','i0_i3',500,0.40,require_basis=False,rb=3)
+ic_st,ic_td,ic_eq,ic_e2,ic_corr,_,_,ic_sr,ic_pct,ic_pos = run_pair('IC','i0_i3',500,0.40,require_basis=False,rb=ROLL_BUF)
 ic_rule = """<b>品种</b>：中证500股指期货（IC）｜<b>组合</b>：<b>近月-隔季 = 多当月(c1) + 空隔季(c4)</b>，1:1 锁合约，各1手<br>
 （说明：c1=当月合约，c4=隔季合约；IC 整体弱于 IM，本组合为 IC 中风险收益最优区。）<br>
 <b>入场</b>：spread_rel=(当月收盘−隔季收盘)/当月收盘，取滚动500日分位；当<b>分位≥0.40（深贴水）</b>时，于<b>次日开盘</b>开多当月(c1)+开空隔季(c4)。<br>
-<b>出场/换月</b>：仅当<b>当月腿距到期≤3交易日换月</b>；<b>持仓期间不主动平仓</b>。<br>
+<b>出场/换月</b>：仅当<b>当月腿距到期≤10交易日换月</b>；<b>持仓期间不主动平仓</b>。<br>
 <b>本金50万</b>，每对保证金约24万，盯市用收盘价。"""
 ic = build_block('IC',ic_st,ic_td,ic_e2,ic_corr,'IC 近月-隔季（深贴水分位≥0.40）',ic_rule,500,0.40,ic_sr,ic_pct,ic_pos)
 
@@ -272,9 +273,9 @@ if sig_ok:
             pos_ltd = contract_last_trade_day(pos['near_c']).date()
             d = dt.date.today(); pos_roll_days = 0
             while d <= pos_ltd:
-                if d.weekday() < 5: pos_roll_days += 1
+                if is_trade_day(d): pos_roll_days += 1
                 d += dt.timedelta(days=1)
-            pos_in_roll = pos_roll_days <= 10
+            pos_in_roll = pos_roll_days <= ROLL_BUF
             x['roll_days'] = pos_roll_days
             x['in_roll_window'] = pos_in_roll
             x['ltd'] = pos_ltd.strftime('%Y-%m-%d')
@@ -301,7 +302,8 @@ if sig_ok:
                 x['action'] = f'【空仓中 · 等待】当前分位 {x["pct"]:.3f} < 阈值 {x["enter_high"]}，继续空仓等待深贴水结构。'
                 x['actionable'] = False
 
-DATA = {'im':im,'ic':ic,'signal':sig,'signal_ok':sig_ok}
+DATA = {'im':im,'ic':ic,'signal':sig,'signal_ok':sig_ok,
+         'trade_cal': cal_json(), 'roll_buf': ROLL_BUF}
 if not sig_ok:
     DATA['signal_err'] = sig_err
 DATA_JSON = json.dumps(DATA, ensure_ascii=False)
@@ -480,14 +482,21 @@ function rollingPct(series, window){
   for(var k=0;k<win.length;k++) if(win[k] <= v) le++;
   return le / win.length;
 }
+var TRADE_CAL = new Set(DATA.trade_cal);   // 真实交易日历（与 Python 推送同源，build 时注入）
+var ROLL_BUF = DATA.roll_buf;               // 换月缓冲（与微信推送一致）
+function ymd(d){ var y=d.getFullYear(); var m=('0'+(d.getMonth()+1)).slice(-2); var dd=('0'+d.getDate()).slice(-2); return ''+y+m+dd; }
+function isTradeDay(dStr){
+  if(TRADE_CAL.has(dStr)) return true;       // 日历覆盖范围内：真实交易日
+  var dt0=new Date(dStr); var wd=dt0.getDay();
+  return wd!==0 && wd!==6;                    // 越界（日历未覆盖年份）：回退周一到周五
+}
 function tradingDaysUntil(ltdStr){
   var today = new Date(); today.setHours(0,0,0,0);
   var ltd = new Date(ltdStr); ltd.setHours(0,0,0,0);
   var cnt = 0;
   var d = new Date(today);
   while(d <= ltd){
-    var wd = d.getDay();
-    if(wd !== 0 && wd !== 6) cnt++;
+    if(isTradeDay(ymd(d))) cnt++;
     d.setDate(d.getDate()+1);
   }
   return cnt;
@@ -548,7 +557,7 @@ function refreshSignal(){
       s.far_basis = s.far_px - s.idx_px;
       s.basis_ok = s.near_basis < 0;
       s.roll_days = tradingDaysUntil(s.ltd);
-      s.in_roll_window = s.roll_days <= 10;
+      s.in_roll_window = s.roll_days <= ROLL_BUF;
       s.quote_date = now.toISOString().slice(0,10);
       s.quote_time = now.toTimeString().slice(0,8);
       var hNearPx = holdNearStr ? parseFloat(holdNearStr.split(',')[3]) : refNearPx;

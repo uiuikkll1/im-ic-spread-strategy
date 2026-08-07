@@ -3,6 +3,8 @@
 import pandas as pd, numpy as np, requests, re, datetime as dt
 import backtest_im_spread as v1
 from spread_hold_lib import contract_last_trade_day
+# 统一真实交易日历 + 换月缓冲（与微信推送 / 实操页回测一致）
+from trade_calendar import ROLL_BUF, is_trade_day
 
 def third_friday(y, m):
     """返回 y 年 m 月第三个周五（股指期货/期权常规交割日）。"""
@@ -106,18 +108,18 @@ def compute_signal():
         far_basis = prices[far]['last'] - idx_last
         basis_ok = near_basis < 0
 
-        # 换月倒计时（用合约代码推导真实最后交易日）
+        # 换月倒计时（用合约代码推导真实最后交易日，真实交易日历统计）
         ltd = contract_last_trade_day(near).date()
         d = today; cnt = 0
         while d <= ltd:
-            if d.weekday() < 5:
+            if is_trade_day(d):
                 cnt += 1
             d += dt.timedelta(days=1)
-        in_roll_window = cnt <= 10
+        in_roll_window = cnt <= ROLL_BUF
 
         # 操作判定（分位过滤，与实操页回测一致；基差仅作提示）
         if in_roll_window:
-            action = f'换月平仓（当月{near}距到期≤10交易日）'
+            action = f'换月平仓（当月{near}距到期≤{ROLL_BUF}交易日）'
             actionable = True
         elif cur_pct >= eh:
             action = f'满足开仓条件（分位{cur_pct:.2f}≥{eh}，当月{near}相对指数贴水{near_basis:.1f}点），次日开盘开多{near}+开空{far}'
