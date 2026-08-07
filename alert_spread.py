@@ -35,8 +35,50 @@ ROLL_BUF = 10   # 距到期≤10交易日进入换月窗口（与用户需求/�
 STALE_TD = 5     # 面板末行距运行日超过 5 个交易日即视为数据滞后，发告警
 
 
+# ---------- 真实交易日历（H2：换月计数/滞后判断需剔除法定假日）----------
+_TRADE_CAL = None   # 中国股市真实交易日集合，格式 'YYYYMMDD'
+_CAL_MIN = None     # 日历最小日期（字符串），用于越界判断
+_CAL_MAX = None     # 日历最大日期（字符串）
+
+def load_trade_calendar(force=False):
+    """拉取中国股市真实交易日历（剔除周末+法定假日）。
+    失败则留空集合，is_trade_day 自动回退『周一到周五』简单判断，保证不死机。"""
+    global _TRADE_CAL, _CAL_MIN, _CAL_MAX
+    if _TRADE_CAL is not None and not force:
+        return _TRADE_CAL
+    try:
+        df = ak.tool_trade_date_hist_sina()
+        col = "trade_date" if "trade_date" in df.columns else df.columns[0]
+        vals = df[col].astype(str).str.replace("-", "").str.strip()
+        _TRADE_CAL = set(vals)
+        _CAL_MIN = min(_TRADE_CAL)
+        _CAL_MAX = max(_TRADE_CAL)
+        print(f"真实交易日历加载完成，共 {len(_TRADE_CAL)} 天（{_CAL_MIN}~{_CAL_MAX}）")
+    except Exception as e:
+        print(f"真实交易日历拉取失败（回退 weekday 简单判断）: {e}")
+        _TRADE_CAL = set()   # 空集合 → is_trade_day 回退 weekday
+        _CAL_MIN = None
+        _CAL_MAX = None
+    return _TRADE_CAL
+
+
+def is_trade_day(d):
+    """判断某日期是否为股市交易日。
+    - 日历已加载且在覆盖范围内：用真实交易日历（剔除法定假日）。
+    - 日历未加载 / 日期超出日历覆盖范围（如 akshare 只到当年12-31，而合约到期在次年）：
+      回退为『周一到周五』简单判断，避免越界日期被静默当成非交易日导致换月计数严重低估。"""
+    cal = load_trade_calendar()
+    if cal:
+        key = d.strftime("%Y%m%d")
+        if _CAL_MIN is not None and (key < _CAL_MIN or key > _CAL_MAX):
+            return d.weekday() < 5   # 越界回退（跨年近月合约到期场景）
+        return key in cal
+    return d.weekday() < 5
+
+
 def trading_days_between(start_iso, end_iso):
-    """两个 ISO 日期之间的交易日数量（含 end，不含 start），用于数据新鲜度判断。"""
+    """两个 ISO 日期之间的交易日数量（含 end，不含 start），用于数据新鲜度判断。
+    使用真实交易日历（剔除法定假日），避免长假误判。"""
     s = dt.date.fromisoformat(start_iso)
     e = dt.date.fromisoformat(end_iso)
     if e <= s:
@@ -44,7 +86,7 @@ def trading_days_between(start_iso, end_iso):
     cnt = 0
     d = s + dt.timedelta(days=1)
     while d <= e:
-        if d.weekday() < 5:
+        if is_trade_day(d):
             cnt += 1
         d += dt.timedelta(days=1)
     return cnt
@@ -183,12 +225,13 @@ def run_core():
         W, enter_high, _idx = PARAMS[prod]
 
         # 换月窗口用「数据日(面板末行)」而非「运行日」，消除双 cron 跨午夜的口径漂移
+        # H2：用真实交易日历数距到期的交易日，剔除国庆/春节等法定假日，避免误报换月
         qday = dt.date.fromisoformat(qdate)
         ltd = contract_last_trade_day(near).date()
         d = qday
         cnt = 0
         while d <= ltd:
-            if d.weekday() < 5:
+            if is_trade_day(d):
                 cnt += 1
             d += dt.timedelta(days=1)
         in_roll = cnt <= ROLL_BUF
