@@ -90,9 +90,9 @@ def extend_data_to_today(raw, pf, mc, prod):
 
 # ---------------- 跑 IM / IC 推荐组合 ----------------
 def run_pair(prod, key, W, enter_high, require_basis=False, rb=ROLL_BUF):
-    raw = pd.read_parquet(f'{prod.lower()}_future_data.parquet'); raw['date']=pd.to_datetime(raw['date'])
-    pf = pd.read_parquet(f'{prod.lower()}_spread_panel_all_{key}.parquet'); pf['date']=pd.to_datetime(pf['date'])
-    mc = pd.read_parquet(f'{prod.lower()}_main_cont.parquet'); mc['date']=pd.to_datetime(mc['date'])
+    raw = pd.read_parquet(f'{prod.lower()}_future_data.parquet'); raw['date']=pd.to_datetime(raw['date']).astype('datetime64[ns]')
+    pf = pd.read_parquet(f'{prod.lower()}_spread_panel_all_{key}.parquet'); pf['date']=pd.to_datetime(pf['date']).astype('datetime64[ns]')
+    mc = pd.read_parquet(f'{prod.lower()}_main_cont.parquet'); mc['date']=pd.to_datetime(mc['date']).astype('datetime64[ns]')
     # 联网补数据：把期货日线拉到最近交易日，避免图表滞后
     raw, pf, mc = extend_data_to_today(raw, pf, mc, prod)
     px = build_px(raw)
@@ -104,7 +104,7 @@ def run_pair(prod, key, W, enter_high, require_basis=False, rb=ROLL_BUF):
     basis_ok = None
     if require_basis:
         idx_name = '中证1000' if prod=='IM' else '中证500'
-        idx = pd.read_parquet(f'{idx_name}_idx.parquet'); idx['date']=pd.to_datetime(idx['date'])
+        idx = pd.read_parquet(f'{idx_name}_idx.parquet'); idx['date']=pd.to_datetime(idx['date']).astype('datetime64[ns]')
         pf2 = pd.merge_asof(pf.sort_values('date'), idx[['date','close']].rename(columns={'close':'idx_close'}).sort_values('date'),
                             on='date', direction='backward').sort_values('date')
         basis_ok = (pf2['near_close'].values - pf2['idx_close'].values) < 0
