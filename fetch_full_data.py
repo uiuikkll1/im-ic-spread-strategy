@@ -146,12 +146,15 @@ def fetch_main_cont(prefix):
 
 
 def fetch_index(sym, name):
-    import akshare as ak
-    df = ak.stock_zh_index_daily(symbol=sym)
-    df = df[['date', 'close']].copy()
+    # 走兼容层：akshare 1.20.44 起 stock_zh_index_daily 改名 index_zh_daily_sina，
+    # 兼容层按「新名 -> 旧名 -> HTTP 直连」探测，避免 CI 装新版后整条数据链断掉。
+    from ak_compat import index_daily_sina
+    full, src = index_daily_sina(sym)
+    df = full[['date', 'Close']].rename(columns={'Close': 'close'}).copy()
     df['date'] = pd.to_datetime(df['date']).astype('datetime64[ns]')
     df = df.sort_values('date').reset_index(drop=True)
     df.to_parquet(os.path.join(HERE, f'{name}_idx.parquet'), index=False)
+    print(f'[index] {name} 来源 {src} 行数={len(df)} 末行={df.tail(1).to_dict("records")}')
     return df
 
 

@@ -1,5 +1,14 @@
-akshare
+# akshare 1.20.44 起一次性 rename 68 个接口，旧名不再保留（调用直接 AttributeError）：
+#   stock_zh_index_daily -> index_zh_daily_sina
+#   index_zh_a_hist      -> index_zh_hist_em
+# 原先前只写 "akshare"、未锁版本，CI 每次装最新版导致线上推送主备双挂（2026-11-14 故障）。
+# 现在：下限锁到改名后的版本，上界锁大版本，避免再次被 breaking change 打穿；
+# 代码侧另有 ak_compat.py 做「新名->旧名->HTTP 直连」三级探测，双保险。
+akshare>=1.20.44,<2
 pandas==3.0.3
 pyarrow==25.0.0
 numpy
 requests
+# 离线交易日历兜底（XSHG）：无需联网，已验证与 akshare 新浪日历在 2025/2026 全年逐日一致。
+# 新浪日历接口再挂也不会让换月倒计时退化成「周一到周五」。
+exchange_calendars>=4.11,<5

@@ -23,12 +23,17 @@ import json
 import time
 import datetime as dt
 import requests
-import akshare as ak
 import pandas as pd
 import numpy as np
 
+# akshare 接口兼容层：1.20.44 起 stock_zh_index_daily 改名 index_zh_daily_sina，
+# index_zh_a_hist 改名 index_zh_hist_em，旧名直接 AttributeError。
+# 兼容层按「新名 -> 旧名 -> HTTP 直连」探测，不再依赖 akshare 具体版本。
+from ak_compat import index_daily_sina, index_daily_em, client_version
+
 # ---------- 策略参数 ----------
-SYMBOL = "sh000852"          # 中证1000 指数
+SYMBOL = "sh000852"          # 中证1000 指数（新浪系，带 sh 前缀）
+EM_SYMBOL = "000852"         # 中证1000 指数（东财系，纯 6 位数字）
 MA_N = 2
 ATR_N = 20
 MULT = 0.6
@@ -38,7 +43,7 @@ STATE_FILE = "atr_state.json"
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "")
 STALE_TD = 5     # 最新行情距今日超过 5 个交易日即视为数据滞后，发告警
 # ATR 侧数据滞后判断也用统一真实交易日历（与 IM/IC 推送一致）
-from trade_calendar import trading_days_between, calendar_ok
+from trade_calendar import trading_days_between, calendar_ok, calendar_source
 
 
 class StateCorrupt(Exception):
@@ -86,34 +91,35 @@ def _alert_once(marker, title, desp, today):
 
 
 def fetch_index():
-    """主源带重试；全部失败回退备用源。返回标准化列 date/Open/High/Low/Close。"""
+    """主源（新浪系）+ 备用源（东财系），均走 ak_compat 兼容层。
+
+    兼容层内部已含「akshare 新名 -> akshare 旧名 -> HTTP 直连」三级兜底，
+    这里只保留业务级重试，返回统一列 date/Open/High/Low/Close。
+    """
     last_err = None
     for attempt in range(3):
         try:
-            df = ak.stock_zh_index_daily(symbol=SYMBOL)
+            df, src = index_daily_sina(SYMBOL)
             if df is not None and len(df) > ATR_N + 5:
-                df = df.rename(columns={"date": "date", "open": "Open", "high": "High",
-                                        "low": "Low", "close": "Close", "volume": "Volume"})
-                print(f"[fetch] 主源成功，{len(df)} 行")
+                print(f"[fetch] 主源成功（{src}），{len(df)} 行")
                 return df
-            last_err = "主源返回空或行数不足"
+            last_err = "主源行数不足(%d)" % (0 if df is None else len(df))
         except Exception as e:
             last_err = e
-            print(f"[fetch] 主源 attempt {attempt+1}/3 失败: {e}")
+            print(f"[fetch] 主源 attempt {attempt + 1}/3 失败: {e}")
             time.sleep(5)
-    # 备用源：东财历史日线
+
+    # 备用源：东财历史日线（同样走兼容层，覆盖「新浪整体不可用」）
     try:
-        df = ak.index_zh_a_hist(symbol="000852", period="daily",
-                                start_date="20000101", end_date="20500101",
-                                adjust="")
+        df, src = index_daily_em(EM_SYMBOL)
         if df is not None and len(df) > ATR_N + 5:
-            df = df.rename(columns={"日期": "date", "开盘": "Open", "最高": "High",
-                                    "最低": "Low", "收盘": "Close", "成交量": "Volume"})
-            print("[fetch] 使用备用源 index_zh_a_hist")
+            print(f"[fetch] 备用源成功（{src}），{len(df)} 行")
             return df
+        last_err = f"{last_err}；备用源行数不足"
     except Exception as e:
         print(f"[fetch] 备用源也失败: {e}")
-    raise RuntimeError(f"指数数据拉取失败: {last_err}")
+        last_err = f"{last_err}；备用源: {e}"
+    raise RuntimeError(f"指数数据拉取失败（akshare {client_version()}）: {last_err}")
 
 
 def wilder_atr(high, low, close, n):
@@ -208,12 +214,13 @@ def run_core():
 
     d_str = f"{d:%Y-%m-%d}"
 
-    # M2：真实日历降级告警（日历拉取失败 → 滞后计数回退 weekday 近似）
+    # M2：真实日历降级告警 —— 只有「akshare / XSHG / 内置表」三级全废才算降级
     if not calendar_ok():
         today = dt.date.today().isoformat()
         if st.get("cal_alerted_date") != today:
             if push_wechat("⚠️ 交易日历降级告警",
-                           "真实交易日历拉取失败，数据滞后计数已回退为周一到周五近似，请检查 akshare 行情源"):
+                           "真实交易日历全部来源失败（akshare 新浪 / XSHG 离线日历 / 内置节假日表），"
+                           "数据滞后计数已回退为周一到周五近似，请检查依赖环境"):
                 st["cal_alerted_date"] = today
                 save_state(st)
 

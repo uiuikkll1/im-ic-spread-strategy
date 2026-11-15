@@ -24,7 +24,9 @@ import numpy as np
 import pandas as pd
 import requests
 
-import akshare as ak
+# 注意：这里原有一行 `import akshare as ak`，全文并无任何 ak. 调用（僵尸依赖）。
+# 已删除 —— 否则 akshare 一旦装坏/改名导致导入异常，IM/IC 推送会在 import 阶段
+# 直接崩掉，连告警都发不出去。本模块的数据全部来自已提交的 parquet。
 from live_signal import PARAMS
 import backtest_im_spread as v1
 from spread_hold_lib import contract_last_trade_day
@@ -174,12 +176,14 @@ def run_core():
     run_day = dt.date.today()           # TZ 已在 workflow 设为 Asia/Shanghai
     gen_date = run_day.isoformat()
 
-    # M2：真实日历降级告警（日历拉取失败 → is_trade_day 回退 weekday 近似，换月判断可能不准）
+    # M2：真实日历降级告警 —— 只有「akshare / XSHG / 内置表」三级全废才算降级，
+    #     否则换月倒计时失真会导致提前/延后换月，比不推更危险。
     if not calendar_ok():
         if state.get("cal_alerted_date") != gen_date:
             ok = push_wechat("⚠️ 交易日历降级告警",
-                             "真实交易日历拉取失败，换月/持仓倒计时已回退为周一到周五近似（不剔除法定假日），"
-                             "换月窗口判断可能失真，请检查 akshare 行情源")
+                             "真实交易日历全部来源失败（akshare 新浪 / XSHG 离线日历 / 内置节假日表），"
+                             "换月/持仓倒计时已回退为周一到周五近似（不剔除法定假日），"
+                             "换月窗口判断可能失真，请检查依赖环境")
             if ok:
                 state["cal_alerted_date"] = gen_date
 
