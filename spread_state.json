@@ -1,8 +1,12 @@
 {
-  "IM": 0,
-  "IC": 0,
-  "IM_key": "2026-11-20",
-  "IC_key": "2026-11-20",
+  "IM": 1,
+  "IC": 1,
+  "IM_key": "2026-11-23",
+  "IC_key": "2026-11-23",
   "stale_alerted_date": "2026-10-18",
-  "cal_alerted_date": "2026-11-15"
+  "cal_alerted_date": "2026-11-15",
+  "IM_near": "IM2612",
+  "IM_far": "IM2706",
+  "IC_near": "IC2612",
+  "IC_far": "IC2706"
 }
